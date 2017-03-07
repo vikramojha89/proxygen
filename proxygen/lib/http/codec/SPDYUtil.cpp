@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -65,7 +65,7 @@ bool SPDYUtil::hasGzipAndDeflate(const std::string& value, bool& hasGzip,
   hasDeflate = false;
   RFC2616::parseQvalues(value, *output);
   for (const auto& encodingQ: *output) {
-    std::string lower(std::move(encodingQ.first.str()));
+    std::string lower(encodingQ.first.str());
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
     // RFC says 3 sig figs
     if (lower == "gzip" && encodingQ.second >= 0.001) {

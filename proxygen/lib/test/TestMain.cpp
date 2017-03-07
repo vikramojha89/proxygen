@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,10 +8,9 @@
  *
  */
 // Use this main function in gtest unit tests to enable glog
-#include <folly/Portability.h>
+#include <folly/portability/GTest.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <gtest/gtest.h>
 
 int main(int argc, char* argv[]) {
   testing::InitGoogleTest(&argc, argv);

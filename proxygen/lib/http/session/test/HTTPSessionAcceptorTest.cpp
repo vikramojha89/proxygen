@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -19,6 +19,7 @@ using namespace testing;
 using folly::AsyncSocket;
 using folly::test::MockAsyncSocket;
 using folly::SocketAddress;
+using wangle::SecureTransportType;
 
 namespace {
 
@@ -55,7 +56,12 @@ class HTTPTargetSessionAcceptor : public HTTPSessionAcceptor {
                                          tinfo);
   }
 
+  void onSessionCreationError(ProxygenError error) override {
+    sessionCreationErrors_++;
+  }
+
   uint32_t sessionsCreated_{0};
+  uint32_t sessionCreationErrors_{0};
   std::string expectedProto_;
 };
 
@@ -125,9 +131,10 @@ TEST_P(HTTPSessionAcceptorTestNPN, npn) {
       SecureTransportType::TLS,
       tinfo);
   EXPECT_EQ(acceptor_->sessionsCreated_, 1);
+  EXPECT_EQ(acceptor_->sessionCreationErrors_, 0);
 }
 
-char const* protos1[] = { "h2-14", "h2", "spdy/3.1", "spdy/3", "spdy/2",
+char const* protos1[] = { "h2-14", "h2", "spdy/3.1", "spdy/3",
                           "http/1.1", "" };
 INSTANTIATE_TEST_CASE_P(NPNPositive,
                         HTTPSessionAcceptorTestNPN,
@@ -153,9 +160,10 @@ TEST_P(HTTPSessionAcceptorTestNPNPlaintext, plaintext_protocols) {
       SecureTransportType::TLS,
       tinfo);
   EXPECT_EQ(acceptor_->sessionsCreated_, 1);
+  EXPECT_EQ(acceptor_->sessionCreationErrors_, 0);
 }
 
-char const* protos2[] = { "spdy/3", "spdy/2", "h2c" };
+char const* protos2[] = { "spdy/3", "h2c" };
 INSTANTIATE_TEST_CASE_P(NPNPlaintext,
                         HTTPSessionAcceptorTestNPNPlaintext,
                         ::testing::ValuesIn(protos2));
@@ -174,4 +182,5 @@ TEST_F(HTTPSessionAcceptorTestNPNJunk, npn) {
       SecureTransportType::TLS,
       tinfo);
   EXPECT_EQ(acceptor_->sessionsCreated_, 0);
+  EXPECT_EQ(acceptor_->sessionCreationErrors_, 1);
 }

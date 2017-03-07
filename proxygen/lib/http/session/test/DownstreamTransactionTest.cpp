@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -47,8 +47,8 @@ class DownstreamTransactionTest : public testing::Test {
             txn->sendBody(makeBuf(size));
             txn->sendEOM();
           }));
-    EXPECT_CALL(transport_, sendHeaders(txn, _, _))
-      .WillOnce(Invoke([=](Unused, const HTTPMessage& headers, Unused) {
+    EXPECT_CALL(transport_, sendHeaders(txn, _, _, _))
+      .WillOnce(Invoke([=](Unused, const HTTPMessage& headers, Unused, Unused) {
             EXPECT_EQ(headers.getStatusCode(), 200);
           }));
     EXPECT_CALL(transport_, sendBody(txn, _, false))
@@ -75,7 +75,7 @@ class DownstreamTransactionTest : public testing::Test {
           }));
     EXPECT_CALL(transport_, notifyPendingEgress())
       .WillOnce(InvokeWithoutArgs([=] {
-            txn->onWriteReady(size);
+            txn->onWriteReady(size, 1);
           }))
       .WillOnce(DoDefault()); // The second call is for sending the eom
 
@@ -85,14 +85,14 @@ class DownstreamTransactionTest : public testing::Test {
  protected:
   folly::EventBase eventBase_;
   folly::HHWheelTimer::UniquePtr transactionTimeouts_{
-    new folly::HHWheelTimer(&eventBase_,
-                            std::chrono::milliseconds(
-                              folly::HHWheelTimer::DEFAULT_TICK_INTERVAL),
-                            folly::AsyncTimeout::InternalEnum::NORMAL,
-                            std::chrono::milliseconds(500))};
+      folly::HHWheelTimer::newTimer(
+          &eventBase_,
+          std::chrono::milliseconds(folly::HHWheelTimer::DEFAULT_TICK_INTERVAL),
+          folly::AsyncTimeout::InternalEnum::NORMAL,
+          std::chrono::milliseconds(500))};
   MockHTTPTransactionTransport transport_;
   StrictMock<MockHTTPHandler> handler_;
-  HTTPTransaction::PriorityQueue txnEgressQueue_;
+  HTTP2PriorityQueue txnEgressQueue_;
   uint32_t received_{0};
   uint32_t sent_{0};
 };
@@ -106,7 +106,7 @@ TEST_F(DownstreamTransactionTest, simple_callback_forwarding) {
   HTTPTransaction txn(
     TransportDirection::DOWNSTREAM,
     HTTPCodec::StreamID(1), 1, transport_,
-    txnEgressQueue_, transactionTimeouts_.get());
+    txnEgressQueue_, WheelTimerInstance(transactionTimeouts_.get()));
   setupRequestResponseFlow(&txn, 100);
 
   txn.onIngressHeadersComplete(makeGetRequest());
@@ -120,7 +120,7 @@ TEST_F(DownstreamTransactionTest, regular_window_update) {
   HTTPTransaction txn(
     TransportDirection::DOWNSTREAM,
     HTTPCodec::StreamID(1), 1, transport_,
-    txnEgressQueue_, transactionTimeouts_.get(),
+    txnEgressQueue_, WheelTimerInstance(transactionTimeouts_.get()),
     nullptr,
     true, // flow control enabled
     400,
@@ -145,7 +145,7 @@ TEST_F(DownstreamTransactionTest, window_increase) {
   HTTPTransaction txn(
     TransportDirection::DOWNSTREAM,
     HTTPCodec::StreamID(1), 1, transport_,
-    txnEgressQueue_, transactionTimeouts_.get(),
+    txnEgressQueue_, WheelTimerInstance(transactionTimeouts_.get()),
     nullptr,
     true, // flow control enabled
     spdy::kInitialWindow,
@@ -176,7 +176,7 @@ TEST_F(DownstreamTransactionTest, window_decrease) {
   HTTPTransaction txn(
     TransportDirection::DOWNSTREAM,
     HTTPCodec::StreamID(1), 1, transport_,
-    txnEgressQueue_, transactionTimeouts_.get(),
+    txnEgressQueue_, WheelTimerInstance(transactionTimeouts_.get()),
     nullptr,
     true, // flow control enabled
     spdy::kInitialWindow,
@@ -203,7 +203,7 @@ TEST_F(DownstreamTransactionTest, parse_error_cbs) {
   HTTPTransaction txn(
     TransportDirection::DOWNSTREAM,
     HTTPCodec::StreamID(1), 1, transport_,
-    txnEgressQueue_, transactionTimeouts_.get());
+    txnEgressQueue_, WheelTimerInstance(transactionTimeouts_.get()));
 
   HTTPException err(HTTPException::Direction::INGRESS, "test");
   err.setHttpStatusCode(400);
@@ -239,7 +239,7 @@ TEST_F(DownstreamTransactionTest, detach_from_notify) {
   HTTPTransaction txn(
     TransportDirection::DOWNSTREAM,
     HTTPCodec::StreamID(1), 1, transport_,
-    txnEgressQueue_, transactionTimeouts_.get());
+    txnEgressQueue_, WheelTimerInstance(transactionTimeouts_.get()));
 
   InSequence dummy;
 
@@ -248,10 +248,10 @@ TEST_F(DownstreamTransactionTest, detach_from_notify) {
     .WillOnce(Invoke([&](std::shared_ptr<HTTPMessage> msg) {
           auto response = makeResponse(200);
           txn.sendHeaders(*response.get());
-          txn.sendBody(std::move(makeBuf(10)));
+          txn.sendBody(makeBuf(10));
         }));
-  EXPECT_CALL(transport_, sendHeaders(&txn, _, _))
-    .WillOnce(Invoke([&](Unused, const HTTPMessage& headers, Unused) {
+  EXPECT_CALL(transport_, sendHeaders(&txn, _, _, _))
+    .WillOnce(Invoke([&](Unused, const HTTPMessage& headers, Unused, Unused) {
           EXPECT_EQ(headers.getStatusCode(), 200);
         }));
   EXPECT_CALL(transport_, notifyEgressBodyBuffered(10));
@@ -278,7 +278,8 @@ TEST_F(DownstreamTransactionTest, deferred_egress) {
   HTTPTransaction txn(
     TransportDirection::DOWNSTREAM,
     HTTPCodec::StreamID(1), 1, transport_,
-    txnEgressQueue_, transactionTimeouts_.get(), nullptr, true, 10, 10);
+    txnEgressQueue_, WheelTimerInstance(transactionTimeouts_.get()),
+    nullptr, true, 10, 10);
 
   InSequence dummy;
 
@@ -287,11 +288,11 @@ TEST_F(DownstreamTransactionTest, deferred_egress) {
     .WillOnce(Invoke([&](std::shared_ptr<HTTPMessage> msg) {
           auto response = makeResponse(200);
           txn.sendHeaders(*response.get());
-          txn.sendBody(std::move(makeBuf(10)));
-          txn.sendBody(std::move(makeBuf(20)));
+          txn.sendBody(makeBuf(10));
+          txn.sendBody(makeBuf(20));
         }));
-  EXPECT_CALL(transport_, sendHeaders(&txn, _, _))
-    .WillOnce(Invoke([&](Unused, const HTTPMessage& headers, Unused) {
+  EXPECT_CALL(transport_, sendHeaders(&txn, _, _, _))
+    .WillOnce(Invoke([&](Unused, const HTTPMessage& headers, Unused, Unused) {
           EXPECT_EQ(headers.getStatusCode(), 200);
         }));
 
@@ -307,7 +308,7 @@ TEST_F(DownstreamTransactionTest, deferred_egress) {
   // onWriteReady, send, then dequeue (SPDY window now full)
   EXPECT_CALL(transport_, notifyEgressBodyBuffered(-20));
 
-  EXPECT_EQ(txn.onWriteReady(20), false);
+  EXPECT_EQ(txn.onWriteReady(20, 1), false);
 
   // enqueued after window update
   EXPECT_CALL(transport_, notifyEgressBodyBuffered(20));
@@ -331,7 +332,7 @@ TEST_F(DownstreamTransactionTest, internal_error) {
   HTTPTransaction txn(
     TransportDirection::DOWNSTREAM,
     HTTPCodec::StreamID(1), 1, transport_,
-    txnEgressQueue_, transactionTimeouts_.get());
+    txnEgressQueue_, WheelTimerInstance(transactionTimeouts_.get()));
 
   InSequence dummy;
 
@@ -341,8 +342,8 @@ TEST_F(DownstreamTransactionTest, internal_error) {
           auto response = makeResponse(200);
           txn.sendHeaders(*response.get());
         }));
-  EXPECT_CALL(transport_, sendHeaders(&txn, _, _))
-    .WillOnce(Invoke([&](Unused, const HTTPMessage& headers, Unused) {
+  EXPECT_CALL(transport_, sendHeaders(&txn, _, _, _))
+    .WillOnce(Invoke([&](Unused, const HTTPMessage& headers, Unused, Unused) {
           EXPECT_EQ(headers.getStatusCode(), 200);
         }));
   EXPECT_CALL(transport_, sendAbort(&txn, ErrorCode::INTERNAL_ERROR));

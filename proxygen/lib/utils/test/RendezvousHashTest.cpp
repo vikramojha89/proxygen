@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,8 +9,7 @@
  */
 #include <folly/Conv.h>
 #include <folly/Foreach.h>
-#include <gtest/gtest.h>
-#include <limits>
+#include <folly/portability/GTest.h>
 #include <map>
 #include <vector>
 

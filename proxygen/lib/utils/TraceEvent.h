@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,15 +12,22 @@
 #include <boost/variant.hpp>
 #include <folly/Conv.h>
 #include <map>
+#include <iosfwd>
+#include <proxygen/lib/utils/Export.h>
 #include <proxygen/lib/utils/Time.h>
 #include <proxygen/lib/utils/TraceEventType.h>
 #include <proxygen/lib/utils/TraceFieldType.h>
 #include <string>
 
 namespace proxygen {
+  // Helpers used to make TraceEventType/TraceFieldType can be used with GLOG
+  FB_EXPORT std::ostream& operator<<(
+      std::ostream& os, TraceEventType eventType);
+  FB_EXPORT std::ostream& operator<<(
+      std::ostream& os, TraceFieldType fieldType);
 
 /**
- * Simple structure to track timming of event in request flow then we can
+ * Simple structure to track timing of event in request flow then we can
  * report back to the application.
  */
 class TraceEvent {
@@ -103,10 +110,10 @@ class TraceEvent {
   };
 
 
-  explicit TraceEvent(TraceEventType type, uint32_t parentID = 0);
+  FB_EXPORT explicit TraceEvent(TraceEventType type, uint32_t parentID = 0);
 
   /**
-   * Sets the end time to the current time according to the TimeUtil.
+   * Sets the start time to the current time according to the TimeUtil.
    */
   void start(const TimeUtil& tm);
 
@@ -227,7 +234,7 @@ class TraceEvent {
     return false;
   }
 
-  bool addMetaInternal(TraceFieldType key, MetaData&& val);
+  FB_EXPORT bool addMetaInternal(TraceFieldType key, MetaData&& val);
 
   enum State {
     NOT_STARTED = 0,

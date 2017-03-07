@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -47,6 +47,7 @@ public:
   bool supportsStreamFlowControl() const override;
   bool supportsSessionFlowControl() const override;
   size_t onIngress(const folly::IOBuf& buf) override;
+  bool supportsPushTransactions() const override { return true; }
   void generateHeader(folly::IOBufQueue& writeBuf,
                       StreamID stream,
                       const HTTPMessage& msg,
@@ -71,9 +72,11 @@ public:
   size_t generateRstStream(folly::IOBufQueue& writeBuf,
                            StreamID txn,
                            ErrorCode statusCode) override;
-  size_t generateGoaway(folly::IOBufQueue& writeBuf,
-                        StreamID lastStream,
-                        ErrorCode statusCode) override;
+  size_t generateGoaway(
+    folly::IOBufQueue& writeBuf,
+    StreamID lastStream,
+    ErrorCode statusCode,
+    std::unique_ptr<folly::IOBuf> debugData = nullptr) override;
   size_t generatePingRequest(folly::IOBufQueue& writeBuf) override;
   size_t generatePingReply(folly::IOBufQueue& writeBuf,
                            uint64_t uniqueID) override;
@@ -81,8 +84,6 @@ public:
   size_t generateWindowUpdate(folly::IOBufQueue& writeBuf,
                               StreamID stream,
                               uint32_t delta) override;
-  void enableDoubleGoawayDrain() override;
-  StreamID getLastIncomingStreamID() const override { return lastStreamID_; }
 
   /**
    * Returns a const reference to the ingress settings. Since ingress
@@ -96,6 +97,9 @@ public:
    * Returns a reference to the egress settings
    */
   HTTPSettings* getEgressSettings() override { return &egressSettings_; }
+  uint32_t getDefaultWindowSize() const override {
+    return spdy::kInitialWindow;
+  }
 
   uint8_t getVersion() const;
 
@@ -110,6 +114,22 @@ public:
 
   void setHeaderCodecStats(HeaderCodec::Stats* stats) override {
     headerCodec_->setStats(stats);
+  }
+
+  size_t addPriorityNodes(
+      PriorityQueue& queue,
+      folly::IOBufQueue& writeBuf,
+      uint8_t maxLevel) override;
+
+  StreamID mapPriorityToDependency(uint8_t priority) const override {
+    return MAX_STREAM_ID + priority;
+  }
+
+  int8_t mapDependencyToPriority(StreamID parent) const override {
+    if (parent >= MAX_STREAM_ID) {
+      return parent - MAX_STREAM_ID;
+    }
+    return -1;
   }
 
   struct SettingData {
@@ -130,14 +150,6 @@ public:
   static boost::optional<SPDYVersion> getVersion(const std::string& protocol);
 
  private:
-
-  /**
-   * Determines whether header with a given code is on the SPDY per-hop
-   * header blacklist.
-   */
-  static std::bitset<256> perHopHeaderCodes_;
-
-  static void initPerHopHeaders() __attribute__ ((__constructor__));
 
   /**
    * Generates a frame of type SYN_STREAM
@@ -234,6 +246,9 @@ public:
                    const compress::HeaderPieceList& headers,
                    int8_t pri,
                    const HTTPHeaderSize& size);
+
+  void deliverOnMessageBegin(StreamID streamID, StreamID assocStreamID,
+                             HTTPMessage* msg);
 
   /**
    * Generate the header for a SPDY data frame

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -49,8 +49,8 @@ static const uint32_t kMaxWritesPerLoop = 32;
 namespace proxygen {
 
 uint32_t HTTPSession::kDefaultReadBufLimit = 65536;
-uint64_t HTTPSession::egressBodySizeLimit_ = 4096;
-uint32_t HTTPSession::kPendingWriteMax = 65536;
+uint32_t HTTPSession::egressBodySizeLimit_ = 4096;
+uint32_t HTTPSession::kDefaultWriteBufLimit = 65536;
 
 HTTPSession::WriteSegment::WriteSegment(
     HTTPSession* session,
@@ -112,6 +112,23 @@ HTTPSession::HTTPSession(
   unique_ptr<HTTPCodec> codec,
   const TransportInfo& tinfo,
   InfoCallback* infoCallback):
+    HTTPSession(WheelTimerInstance(transactionTimeouts), std::move(sock),
+        localAddr, peerAddr, controller, std::move(codec),
+        tinfo, infoCallback) {
+}
+
+HTTPSession::HTTPSession(
+  const WheelTimerInstance& timeout,
+  AsyncTransportWrapper::UniquePtr sock,
+  const SocketAddress& localAddr,
+  const SocketAddress& peerAddr,
+  HTTPSessionController* controller,
+  unique_ptr<HTTPCodec> codec,
+  const TransportInfo& tinfo,
+  InfoCallback* infoCallback):
+    txnEgressQueue_(isHTTP2CodecProtocol(codec->getProtocol()) ?
+                    WheelTimerInstance(timeout) :
+                    WheelTimerInstance()),
     localAddr_(localAddr),
     peerAddr_(peerAddr),
     sock_(std::move(sock)),
@@ -120,7 +137,8 @@ HTTPSession::HTTPSession(
     infoCallback_(infoCallback),
     writeTimeout_(this),
     flowControlTimeout_(this),
-    transactionTimeouts_(CHECK_NOTNULL(transactionTimeouts)),
+    drainTimeout_(this),
+    timeout_(timeout),
     transportInfo_(tinfo),
     reads_(SocketState::PAUSED),
     writes_(SocketState::UNPAUSED),
@@ -131,32 +149,18 @@ HTTPSession::HTTPSession(
     resetAfterDrainingWrites_(false),
     resetSocketOnShutdown_(false),
     ingressError_(false),
-    inLoopCallback_(false) {
+    inLoopCallback_(false),
+    inResume_(false),
+    pendingPause_(false) {
+
+  initialReceiveWindow_ = receiveStreamWindowSize_ =
+    receiveSessionWindowSize_ = codec_->getDefaultWindowSize();
 
   codec_.add<HTTPChecks>();
 
-  if (!codec_->supportsParallelRequests()) {
-    // until we support upstream pipelining
-    maxConcurrentIncomingStreams_ = 1;
-    maxConcurrentOutgoingStreamsConfig_ = isDownstream() ? 0 : 1;
-  }
+  setupCodec();
 
-  HTTPSettings* settings = codec_->getEgressSettings();
-  if (settings) {
-    settings->setSetting(SettingsId::MAX_CONCURRENT_STREAMS,
-                         maxConcurrentIncomingStreams_);
-  }
-
-  codec_->generateConnectionPreface(writeBuf_);
-
-  if (codec_->supportsSessionFlowControl()) {
-    connFlowControl_ = new FlowControlFilter(*this, writeBuf_, codec_.call());
-    codec_.addFilters(std::unique_ptr<FlowControlFilter>(connFlowControl_));
-  }
-
-  if (!codec_->supportsPushTransactions()) {
-    maxConcurrentPushTransactions_ = 0;
-  }
+  nextEgressResults_.reserve(maxConcurrentIncomingStreams_);
 
   // If we receive IPv4-mapped IPv6 addresses, convert them to IPv4.
   localAddr_.tryConvertToIPv4();
@@ -165,17 +169,45 @@ HTTPSession::HTTPSession(
   if (infoCallback_) {
     infoCallback_->onCreate(*this);
   }
-  codec_.setCallback(this);
 
   if (controller_) {
     controller_->attachSession(this);
   }
+
+  if (!sock_->isReplaySafe()) {
+    sock_->setReplaySafetyCallback(this);
+  }
+}
+
+void HTTPSession::setupCodec() {
+  if (!codec_->supportsParallelRequests()) {
+    // until we support upstream pipelining
+    maxConcurrentIncomingStreams_ = 1;
+    maxConcurrentOutgoingStreamsRemote_ = isDownstream() ? 0 : 1;
+  }
+
+  HTTPSettings* settings = codec_->getEgressSettings();
+  if (settings) {
+    settings->setSetting(SettingsId::MAX_CONCURRENT_STREAMS,
+                         maxConcurrentIncomingStreams_);
+  }
+  codec_->generateConnectionPreface(writeBuf_);
+
+  if (codec_->supportsSessionFlowControl() && !connFlowControl_) {
+    connFlowControl_ = new FlowControlFilter(*this, writeBuf_, codec_.call());
+    codec_.addFilters(std::unique_ptr<FlowControlFilter>(connFlowControl_));
+    // if we really support switching from spdy <-> h2, we need to update
+    // existing flow control filter
+  }
+
+  codec_.setCallback(this);
 }
 
 HTTPSession::~HTTPSession() {
   VLOG(4) << *this << " closing";
 
   CHECK(transactions_.empty());
+  txnEgressQueue_.dropPriorityNodes();
   CHECK(txnEgressQueue_.empty());
   DCHECK(!sock_->getReadCallback());
 
@@ -225,8 +257,8 @@ void HTTPSession::setFlowControl(size_t initialReceiveWindow,
   CHECK(!started_);
   initialReceiveWindow_ = initialReceiveWindow;
   receiveStreamWindowSize_ = receiveStreamWindowSize;
-  // TODO(t6558522): line up kDefaultReadBufLimit and receiveSessionWindowSize
   receiveSessionWindowSize_ = receiveSessionWindowSize;
+  readBufLimit_ = receiveSessionWindowSize;;
   HTTPSettings* settings = codec_->getEgressSettings();
   if (settings) {
     settings->setSetting(SettingsId::INITIAL_WINDOW_SIZE,
@@ -236,16 +268,7 @@ void HTTPSession::setFlowControl(size_t initialReceiveWindow,
 
 void HTTPSession::setMaxConcurrentOutgoingStreams(uint32_t num) {
   CHECK(!started_);
-  if (codec_->supportsParallelRequests()) {
-    maxConcurrentOutgoingStreamsConfig_ = num;
-  }
-}
-
-void HTTPSession::setMaxConcurrentPushTransactions(uint32_t num) {
-  CHECK(!started_);
-  if (codec_->supportsPushTransactions()) {
-    maxConcurrentPushTransactions_ = num;
-  }
+  maxConcurrentOutgoingStreamsConfig_ = num;
 }
 
 void HTTPSession::setMaxConcurrentIncomingStreams(uint32_t num) {
@@ -258,6 +281,11 @@ void HTTPSession::setMaxConcurrentIncomingStreams(uint32_t num) {
                            maxConcurrentIncomingStreams_);
     }
   }
+}
+
+void HTTPSession::setEgressBytesLimit(uint64_t bytesLimit) {
+  CHECK(!started_);
+  egressBytesLimit_ = bytesLimit;
 }
 
 void
@@ -287,7 +315,11 @@ HTTPSession::readTimeoutExpired() noexcept {
   VLOG(4) << *this << " Timeout with nothing pending";
 
   setCloseReason(ConnectionCloseReason::TIMEOUT);
-  shutdownTransport(true, true);
+  if (controller_) {
+    timeout_.scheduleTimeout(&drainTimeout_,
+                             controller_->getGracefulShutdownTimeout());
+  }
+  notifyPendingShutdown();
 }
 
 void
@@ -325,7 +357,8 @@ HTTPSession::isBusy() const {
   return !transactions_.empty() || codec_->isBusy();
 }
 
-void HTTPSession::notifyPendingEgress() noexcept {
+void
+HTTPSession::notifyPendingEgress() noexcept {
   scheduleWrite();
 }
 
@@ -351,6 +384,19 @@ HTTPSession::closeWhenIdle() {
   }
 }
 
+void HTTPSession::immediateShutdown() {
+  if (isLoopCallbackScheduled()) {
+    cancelLoopCallback();
+  }
+  if (shutdownTransportCb_) {
+    shutdownTransportCb_.reset();
+  }
+  // checkForShutdown only closes the connection if these conditions are true
+  DCHECK(writesShutdown());
+  DCHECK(transactions_.empty());
+  checkForShutdown();
+}
+
 void
 HTTPSession::dropConnection() {
   VLOG(4) << "dropping " << *this;
@@ -367,6 +413,7 @@ HTTPSession::dropConnection() {
     // If so, writes will not be shutdown, so fall through to
     // shutdownTransportWithReset.
     if (readsShutdown() && writesShutdown()) {
+      immediateShutdown();
       return;
     }
   }
@@ -410,14 +457,12 @@ HTTPSession::readDataAvailable(size_t readSize) noexcept {
 
 bool
 HTTPSession::isBufferMovable() noexcept {
-  return false;
+  return true;
 }
 
 void
 HTTPSession::readBufferAvailable(std::unique_ptr<IOBuf> readBuf) noexcept {
-  CHECK(kOpenSslModeMoveBufferOwnership);
-
-  size_t readSize = readBuf->length();
+  size_t readSize = readBuf->computeChainDataLength();
   VLOG(5) << "read completed on " << *this << ", bytes=" << readSize;
 
   DestructorGuard dg(this);
@@ -433,9 +478,8 @@ HTTPSession::readBufferAvailable(std::unique_ptr<IOBuf> readBuf) noexcept {
 
 void
 HTTPSession::processReadData() {
-  // skip the empty IOBuf before feeding CODEC.
-  while(kOpenSslModeMoveBufferOwnership &&
-        readBuf_.front() != nullptr && readBuf_.front()->length() == 0) {
+  // skip any empty IOBufs before feeding CODEC.
+  while (readBuf_.front() != nullptr && readBuf_.front()->length() == 0) {
     readBuf_.pop_front();
   }
 
@@ -470,7 +514,7 @@ HTTPSession::readEOF() noexcept {
   // due to client-side issues with the SSL cert. Note that it can also
   // happen if the client sends a SPDY frame header but no body.
   if (infoCallback_
-      && transportInfo_.ssl && transactionSeqNo_ == 0 && readBuf_.empty()) {
+      && transportInfo_.secure && transactionSeqNo_ == 0 && readBuf_.empty()) {
     infoCallback_->onIngressError(*this, kErrorClientSilent);
   }
 
@@ -486,34 +530,35 @@ void
 HTTPSession::readErr(const AsyncSocketException& ex) noexcept {
   DestructorGuard guard(this);
   VLOG(4) << "read error on " << *this << ": " << ex.what();
-  if (infoCallback_ && (
-        ERR_GET_LIB(ex.getErrno()) == ERR_LIB_USER &&
-        ERR_GET_REASON(ex.getErrno()) ==
-        (int)AsyncSSLSocket::SSL_CLIENT_RENEGOTIATION_ATTEMPT)) {
-    infoCallback_->onIngressError(*this, kErrorClientRenegotiation);
+
+  auto sslEx = dynamic_cast<const folly::SSLException*>(&ex);
+  if (infoCallback_ && sslEx) {
+    if (sslEx->getSSLError() == folly::SSLError::CLIENT_RENEGOTIATION) {
+      infoCallback_->onIngressError(*this, kErrorClientRenegotiation);
+    }
   }
 
   // We're definitely finished reading. Don't close the write side
   // of the socket if there are outstanding transactions, though.
   // Instead, give the transactions a chance to produce any remaining
   // output.
-  if (ERR_GET_LIB(ex.getErrno()) == ERR_LIB_SSL) {
-    transportInfo_.sslError = ERR_GET_REASON(ex.getErrno());
+  if (sslEx && sslEx->getSSLError() == folly::SSLError::SSL_ERROR) {
+    transportInfo_.sslError = ex.what();
   }
   setCloseReason(ConnectionCloseReason::IO_READ_ERROR);
-  shutdownTransport(true, transactions_.empty());
+  shutdownTransport(true, transactions_.empty(), ex.what());
 }
 
 HTTPTransaction*
-HTTPSession::newPushedTransaction(HTTPCodec::StreamID assocStreamId,
-                                  HTTPTransaction::PushHandler* handler,
-                                  int8_t priority) noexcept {
+HTTPSession::newPushedTransaction(
+  HTTPCodec::StreamID assocStreamId,
+  HTTPTransaction::PushHandler* handler) noexcept {
   if (!codec_->supportsPushTransactions()) {
     return nullptr;
   }
   CHECK(isDownstream());
   CHECK_NOTNULL(handler);
-  if (draining_ || (pushedTxns_ >= maxConcurrentPushTransactions_)) {
+  if (draining_ || (outgoingStreams_ >= maxConcurrentOutgoingStreamsRemote_)) {
     // This session doesn't support any more push transactions
     // This could be an actual problem - since a single downstream SPDY session
     // might be connected to N upstream hosts, each of which send M pushes,
@@ -523,8 +568,7 @@ HTTPSession::newPushedTransaction(HTTPCodec::StreamID assocStreamId,
   }
 
   HTTPTransaction* txn = createTransaction(codec_->createStream(),
-                                           assocStreamId,
-                                           priority);
+                                           assocStreamId);
   if (!txn) {
     return nullptr;
   }
@@ -539,9 +583,10 @@ HTTPSession::newPushedTransaction(HTTPCodec::StreamID assocStreamId,
 size_t HTTPSession::getCodecSendWindowSize() const {
   const HTTPSettings* settings = codec_->getIngressSettings();
   if (settings) {
-    return settings->getSetting(SettingsId::INITIAL_WINDOW_SIZE, 65536);
+    return settings->getSetting(SettingsId::INITIAL_WINDOW_SIZE,
+                                codec_->getDefaultWindowSize());
   }
-  return 65536;
+  return codec_->getDefaultWindowSize();
 }
 
 void
@@ -556,9 +601,30 @@ HTTPSession::setNewTransactionPauseState(HTTPCodec::StreamID streamID) {
     VLOG(4) << *this << " starting streamID=" << txn->getID()
             << " egress paused. pendingWriteSize_=" << pendingWriteSize_
             << ", numActiveWrites_=" << numActiveWrites_
-            << ", kPendingWriteMax=" << kPendingWriteMax;
+            << ", writeBufLimit_=" << writeBufLimit_;
     txn->pauseEgress();
   }
+}
+
+http2::PriorityUpdate
+HTTPSession::getMessagePriority(const HTTPMessage* msg) {
+  http2::PriorityUpdate h2Pri = http2::DefaultPriority;
+
+  // if HTTP2 priorities are enabled, get them from the message
+  // and ignore otherwise
+  if (getHTTP2PrioritiesEnabled() && msg) {
+    auto res = msg->getHTTP2Priority();
+    if (res) {
+      h2Pri.streamDependency = std::get<0>(*res);
+      h2Pri.exclusive = std::get<1>(*res);
+      h2Pri.weight = std::get<2>(*res);
+    } else {
+      // HTTPMessage with setPriority called explicitly
+      h2Pri.streamDependency =
+        codec_->mapPriorityToDependency(msg->getPriority());
+    }
+  }
+  return h2Pri;
 }
 
 void
@@ -607,10 +673,8 @@ HTTPSession::onMessageBeginImpl(HTTPCodec::StreamID streamID,
     }
   }
 
-  txn = createTransaction(streamID,
-                          assocStreamID,
-                          msg ? msg->getPriority() : 0);
-
+  http2::PriorityUpdate messagePriority = getMessagePriority(msg);
+  txn = createTransaction(streamID, assocStreamID, messagePriority);
   if (!txn) {
     // This could happen if the socket is bad.
     return nullptr;
@@ -629,13 +693,13 @@ HTTPSession::onMessageBeginImpl(HTTPCodec::StreamID streamID,
   if (!codec_->supportsParallelRequests() && transactions_.size() > 1) {
     // The previous transaction hasn't completed yet. Pause reads until
     // it completes; this requires pausing both transactions.
-    DCHECK(transactions_.size() == 2);
+    DCHECK_EQ(transactions_.size(), 2);
     auto prevTxn = &transactions_.begin()->second;
     if (!prevTxn->isIngressPaused()) {
       DCHECK(prevTxn->isIngressComplete());
       prevTxn->pauseIngress();
     }
-    DCHECK(liveTransactions_ == 1);
+    DCHECK_EQ(liveTransactions_, 1);
     txn->pauseIngress();
   }
 
@@ -666,7 +730,7 @@ HTTPSession::onHeadersComplete(HTTPCodec::StreamID streamID,
   const char* sslCipher =
       transportInfo_.sslCipher ? transportInfo_.sslCipher->c_str() : nullptr;
   msg->setSecureInfo(transportInfo_.sslVersion, sslCipher);
-  msg->setSecure(transportInfo_.ssl);
+  msg->setSecure(transportInfo_.secure);
 
   setupOnHeadersComplete(txn, msg.get());
 
@@ -710,10 +774,10 @@ HTTPSession::onBody(HTTPCodec::StreamID streamID,
     // Transaction must have buffered something and not called
     // notifyBodyProcessed() on it.
     VLOG(4) << *this << " Enqueued ingress. Ingress buffer uses "
-            << pendingReadSize_  << " of "  << kDefaultReadBufLimit
+            << pendingReadSize_  << " of "  << readBufLimit_
             << " bytes.";
-    if (pendingReadSize_ > kDefaultReadBufLimit &&
-        oldSize <= kDefaultReadBufLimit) {
+    if (pendingReadSize_ > readBufLimit_ &&
+        oldSize <= readBufLimit_) {
       VLOG(4) << *this << " pausing due to read limit exceeded.";
       if (infoCallback_) {
         infoCallback_->onIngressLimitExceeded(*this);
@@ -831,6 +895,7 @@ HTTPSession::onMessageComplete(HTTPCodec::StreamID streamID,
 
 void HTTPSession::onError(HTTPCodec::StreamID streamID,
                           const HTTPException& error, bool newTxn) {
+  DestructorGuard dg(this);
   // The codec detected an error in the ingress stream, possibly bad
   // syntax, a truncated message, or bad semantics in the frame.  If reads
   // are paused, queue up the event; otherwise, process it now.
@@ -844,6 +909,7 @@ void HTTPSession::onError(HTTPCodec::StreamID streamID,
     // this error should only prevent us from reading/handling more errors
     // on serial streams
     ingressError_ = true;
+    setCloseReason(ConnectionCloseReason::SESSION_PARSE_ERROR);
   }
   if ((streamID == 0) && infoCallback_) {
     infoCallback_->onIngressError(*this, kErrorMessage);
@@ -880,6 +946,11 @@ void HTTPSession::onError(HTTPCodec::StreamID streamID,
   }
 
   txn->onError(error);
+  if (!codec_->isReusable() && transactions_.empty()) {
+    VLOG(4) << *this << "shutdown from onError";
+    setCloseReason(ConnectionCloseReason::SESSION_PARSE_ERROR);
+    shutdownTransport(true, true);
+  }
 }
 
 void HTTPSession::onAbort(HTTPCodec::StreamID streamID,
@@ -901,8 +972,10 @@ void HTTPSession::onAbort(HTTPCodec::StreamID streamID,
   if (isDownstream() && txn->getAssocTxnId() == 0 &&
       code == ErrorCode::CANCEL) {
     // Cancelling the assoc txn cancels all push txns
-    for (auto pushTxnId : txn->getPushedTransactions()) {
-      auto pushTxn = findTransaction(pushTxnId);
+    for (auto it = txn->getPushedTransactions().begin();
+         it != txn->getPushedTransactions().end(); ) {
+      auto pushTxn = findTransaction(*it);
+      ++it;
       DCHECK(pushTxn != nullptr);
       pushTxn->onError(ex);
     }
@@ -911,7 +984,8 @@ void HTTPSession::onAbort(HTTPCodec::StreamID streamID,
 }
 
 void HTTPSession::onGoaway(uint64_t lastGoodStreamID,
-                           ErrorCode code) {
+                           ErrorCode code,
+                           std::unique_ptr<folly::IOBuf> debugData) {
   DestructorGuard g(this);
   VLOG(4) << "GOAWAY on " << *this << ", code=" << getErrorCodeString(code);
 
@@ -919,6 +993,11 @@ void HTTPSession::onGoaway(uint64_t lastGoodStreamID,
 
   // Drain active transactions and prevent new transactions
   drain();
+
+  // We give the less-forceful onGoaway() first so that transactions have
+  // a chance to do stat tracking before potentially getting a forceful
+  // onError().
+  invokeOnAllTransactions(&HTTPTransaction::onGoaway, code);
 
   // Abort transactions which have been initiated but not created
   // successfully at the remote end. Upstream transactions are created
@@ -945,13 +1024,16 @@ void HTTPSession::onGoaway(uint64_t lastGoodStreamID,
 
   if (firstStream != HTTPCodec::NoStream && code != ErrorCode::NO_ERROR) {
     // If we get a codec error, we will attempt to blame the first stream
-    // by delivering a specific error to it a let the rest of the stream
+    // by delivering a specific error to it and let the rest of the streams
     // get a normal unacknowledged stream error.
     ProxygenError err = kErrorStreamUnacknowledged;
+    string debugInfo = (debugData) ?
+      folly::to<string>(" with debug info: ", (char*)debugData->data()) : "";
     HTTPException ex(HTTPException::Direction::INGRESS_AND_EGRESS,
       folly::to<std::string>(getErrorString(err),
         " on transaction id: ", firstStream,
-        " with codec error: ", getErrorCodeString(code)));
+        " with codec error: ", getErrorCodeString(code),
+        debugInfo));
     ex.setProxygenError(err);
     errorOnTransactionId(firstStream, std::move(ex));
   } else if (firstStream != HTTPCodec::NoStream) {
@@ -1005,6 +1087,7 @@ void HTTPSession::onWindowUpdate(HTTPCodec::StreamID streamID,
 }
 
 void HTTPSession::onSettings(const SettingsList& settings) {
+  DestructorGuard g(this);
   for (auto& setting: settings) {
     if (setting.id == SettingsId::INITIAL_WINDOW_SIZE) {
       onSetSendWindow(setting.value);
@@ -1012,6 +1095,86 @@ void HTTPSession::onSettings(const SettingsList& settings) {
       onSetMaxInitiatedStreams(setting.value);
     }
   }
+  if (codec_->generateSettingsAck(writeBuf_) > 0) {
+    scheduleWrite();
+  }
+}
+
+void HTTPSession::onSettingsAck() {
+  VLOG(4) << *this << " received settings ack";
+}
+
+void HTTPSession::onPriority(HTTPCodec::StreamID streamID,
+                             const HTTPMessage::HTTPPriority& pri) {
+  if (!getHTTP2PrioritiesEnabled()) {
+    return;
+  }
+  http2::PriorityUpdate h2Pri{std::get<0>(pri), std::get<1>(pri),
+      std::get<2>(pri)};
+  HTTPTransaction* txn = findTransaction(streamID);
+  if (txn) {
+    // existing txn, change pri
+    txn->onPriorityUpdate(h2Pri);
+  } else {
+    // virtual node
+    txnEgressQueue_.addOrUpdatePriorityNode(streamID, h2Pri);
+  }
+}
+
+bool HTTPSession::onNativeProtocolUpgradeImpl(
+  HTTPCodec::StreamID streamID, std::unique_ptr<HTTPCodec> codec,
+  const std::string& protocolString) {
+  CHECK_EQ(streamID, 1);
+  HTTPTransaction* txn = findTransaction(streamID);
+  CHECK(txn);
+  // only HTTP1xCodec calls onNativeProtocolUpgrade
+  CHECK(!codec_->supportsParallelRequests());
+
+  // Reset to  defaults
+  maxConcurrentIncomingStreams_ = 100;
+  maxConcurrentOutgoingStreamsRemote_ = 10000;
+
+  // overwrite destination, delay current codec deletion until the end
+  // of the event loop
+  auto oldCodec = codec_.setDestination(std::move(codec));
+  sock_->getEventBase()->runInLoop([oldCodec = std::move(oldCodec)] () {});
+
+  if (controller_) {
+    controller_->onSessionCodecChange(this);
+  }
+
+  setupCodec();
+
+  // txn will be streamID=1, have to make a placeholder
+  (void)codec_->createStream();
+
+  // trigger settings frame that would have gone out in startNow()
+  HTTPSettings* settings = codec_->getEgressSettings();
+  if (settings) {
+    settings->setSetting(SettingsId::INITIAL_WINDOW_SIZE,
+                         initialReceiveWindow_);
+  }
+  sendSettings();
+  if (connFlowControl_) {
+    connFlowControl_->setReceiveWindowSize(writeBuf_,
+                                           receiveSessionWindowSize_);
+    scheduleWrite();
+  }
+
+  // Convert the transaction that contained the Upgrade header
+  txn->reset(codec_->supportsStreamFlowControl(),
+             initialReceiveWindow_,
+             receiveStreamWindowSize_,
+             getCodecSendWindowSize());
+
+  if (!transportInfo_.secure &&
+      (!transportInfo_.appProtocol ||
+       transportInfo_.appProtocol->empty())) {
+    transportInfo_.appProtocol = std::make_shared<string>(
+      protocolString);
+  }
+
+  return true;
 }
 
 void HTTPSession::onSetSendWindow(uint32_t windowSize) {
@@ -1034,10 +1197,16 @@ void HTTPSession::onSetMaxInitiatedStreams(uint32_t maxTxns) {
   }
 }
 
+size_t HTTPSession::sendSettings() {
+  size_t size = codec_->generateSettings(writeBuf_);
+  scheduleWrite();
+  return size;
+}
+
 void HTTPSession::pauseIngress(HTTPTransaction* txn) noexcept {
   VLOG(4) << *this << " pausing streamID=" << txn->getID() <<
     ", liveTransactions_ was " << liveTransactions_;
-  CHECK(liveTransactions_ > 0);
+  CHECK_GT(liveTransactions_, 0);
   --liveTransactions_;
   if (liveTransactions_ == 0) {
     pauseReads();
@@ -1068,12 +1237,23 @@ HTTPSession::transactionTimeout(HTTPTransaction* txn) noexcept {
 
   if (!txn->getHandler() &&
       txn->getEgressState() == HTTPTransactionEgressSM::State::Start) {
-    VLOG(4) << *this << " creating direct error handler";
-    auto handler = getTransactionTimeoutHandler(txn);
-    txn->setHandler(handler);
+    VLOG(4) << *this << " Timed out receiving headers";
     if (infoCallback_) {
       infoCallback_->onIngressError(*this, kErrorTimeout);
     }
+    if (codec_->supportsParallelRequests()) {
+      // This can only happen with HTTP/2 where the HEADERS frame is incomplete
+      // and we time out waiting for the CONTINUATION.  Abort the request.
+      //
+      // It would maybe be a little nicer to use the timeout handler for these
+      // also.
+      txn->sendAbort();
+      return;
+    }
+
+    VLOG(4) << *this << " creating direct error handler";
+    auto handler = getTransactionTimeoutHandler(txn);
+    txn->setHandler(handler);
   }
 
   // Tell the transaction about the timeout.  The transaction will
@@ -1084,7 +1264,8 @@ HTTPSession::transactionTimeout(HTTPTransaction* txn) noexcept {
 
 void HTTPSession::sendHeaders(HTTPTransaction* txn,
                               const HTTPMessage& headers,
-                              HTTPHeaderSize* size) noexcept {
+                              HTTPHeaderSize* size,
+                              bool includeEOM) noexcept {
   CHECK(started_);
   unique_ptr<IOBuf> goawayBuf;
   if (shouldShutdown()) {
@@ -1095,6 +1276,14 @@ void HTTPSession::sendHeaders(HTTPTransaction* txn,
     goawayBuf = writeBuf_.move();
     writeBuf_.append(std::move(writeBuf));
   }
+  if (isUpstream() || (txn->isPushed() && headers.isRequest())) {
+    // upstream picks priority
+    if (getHTTP2PrioritiesEnabled()) {
+      auto pri = getMessagePriority(&headers);
+      txn->onPriorityUpdate(pri);
+    }
+  }
+
   const bool wasReusable = codec_->isReusable();
   const uint64_t oldOffset = sessionByteOffset();
   // Only PUSH_PROMISE (not push response) has an associated stream
@@ -1102,12 +1291,12 @@ void HTTPSession::sendHeaders(HTTPTransaction* txn,
                          txn->getID(),
                          headers,
                          headers.isRequest() ? txn->getAssocTxnId() : 0,
-                         false, // eom
+                         includeEOM,
                          size);
   const uint64_t newOffset = sessionByteOffset();
 
   // only do it for downstream now to bypass handling upstream reuse cases
-  if (isDownstream() &&
+  if (isDownstream() && headers.isResponse() &&
       newOffset > oldOffset &&
       // catch 100-ish response?
       !txn->testAndSetFirstHeaderByteSent() && byteEventTracker_) {
@@ -1122,8 +1311,37 @@ void HTTPSession::sendHeaders(HTTPTransaction* txn,
     VLOG(4) << *this << " moved GOAWAY to end of writeBuf";
     writeBuf_.append(std::move(goawayBuf));
   }
+  if (includeEOM) {
+    commonEom(txn, 0, true);
+  }
   scheduleWrite();
   onHeadersSent(headers, wasReusable);
+}
+
+void
+HTTPSession::commonEom(
+    HTTPTransaction* txn,
+    size_t encodedSize,
+    bool piggybacked) noexcept {
+  // TODO: sort out the TransportCallback for all the EOM handling cases.
+  //  Current code has the same behavior as before when there wasn't commonEom.
+  //  The issue here is onEgressBodyLastByte can be called twice, depending on
+  //  the encodedSize. E.g., when codec actually write to buffer in sendEOM.
+  if (!txn->testAndSetFirstByteSent()) {
+    txn->onEgressBodyFirstByte();
+  }
+  if (!piggybacked) {
+    txn->onEgressBodyLastByte();
+  }
+  // in case encodedSize == 0 we won't get TTLBA which is acceptable
+  // noting the fact that we don't have a response body
+  if (byteEventTracker_ && (encodedSize > 0)) {
+     byteEventTracker_->addLastByteEvent(
+        txn,
+        sessionByteOffset(),
+        sock_->isEorTrackingEnabled());
+  }
+  onEgressMessageFinished(txn);
 }
 
 size_t
@@ -1143,16 +1361,8 @@ HTTPSession::sendBody(HTTPTransaction* txn,
     byteEventTracker_->addFirstBodyByteEvent(offset, txn);
   }
   if (includeEOM) {
-    if (!txn->testAndSetFirstByteSent()) {
-      txn->onEgressBodyFirstByte();
-    }
-    if (encodedSize > 0 && byteEventTracker_) {
-      byteEventTracker_->addLastByteEvent(txn, sessionByteOffset(),
-                                          sock_->isEorTrackingEnabled());
-    }
-
     VLOG(5) << *this << " sending EOM in body for streamID=" << txn->getID();
-    onEgressMessageFinished(txn);
+    commonEom(txn, encodedSize, true);
   }
   return encodedSize;
 }
@@ -1216,15 +1426,14 @@ HTTPSession::onEgressMessageFinished(HTTPTransaction* txn, bool withRST) {
       // message may be in the parse loop, so give it a chance to
       // finish out and avoid a kErrorEOF
 
-      // Just for safety, bump the refcount on this session to keep it
-      // live until the loopCb runs
-      auto dg = new DestructorGuard(this);
-      sock_->getEventBase()->runInLoop([this, dg] {
-          VLOG(4) << *this << " shutdown from onEgressMessageFinished";
-          bool shutdownReads = isDownstream() && !ingressUpgraded_;
-          shutdownTransport(shutdownReads, true);
-          delete dg;
-        }, true);
+      // we can get here during shutdown, in that case do not schedule a
+      // shutdown callback again
+      if (!shutdownTransportCb_) {
+        // Just for safety, the following bumps the refcount on this session
+        // to keep it live until the loopCb runs
+        shutdownTransportCb_.reset(new ShutdownTransportCallback(this));
+        sock_->getEventBase()->runInLoop(shutdownTransportCb_.get(), true);
+      }
     }
   }
 }
@@ -1238,18 +1447,7 @@ HTTPSession::sendEOM(HTTPTransaction* txn) noexcept {
   VLOG(4) << *this << " sending EOM for streamID=" << txn->getID();
   size_t encodedSize = codec_->generateEOM(writeBuf_, txn->getID());
   // PRIO_TODO: boost this transaction's priority? evaluate impact...
-  if (!txn->testAndSetFirstByteSent()) {
-    txn->onEgressBodyFirstByte();
-  }
-  txn->onEgressBodyLastByte();
-  if (encodedSize > 0 && byteEventTracker_) {
-    byteEventTracker_->addLastByteEvent(txn, sessionByteOffset(),
-                                        sock_->isEorTrackingEnabled());
-  }
-  // in case encodedSize == 0 we won't get TTLBA which is acceptable
-  // noting the fact that we don't have a response body
-
-  onEgressMessageFinished(txn);
+  commonEom(txn, encodedSize, false);
   return encodedSize;
 }
 
@@ -1281,6 +1479,11 @@ size_t HTTPSession::sendAbort(HTTPTransaction* txn,
   return encodedSize;
 }
 
+size_t HTTPSession::sendPriority(HTTPTransaction* txn,
+                                 const http2::PriorityUpdate& pri) noexcept {
+  return sendPriorityImpl(txn->getID(), pri);
+}
+
 void
 HTTPSession::decrementTransactionCount(HTTPTransaction* txn,
                                        bool ingressEOM, bool egressEOM) {
@@ -1302,7 +1505,6 @@ HTTPSession::detach(HTTPTransaction* txn) noexcept {
   HTTPCodec::StreamID streamID = txn->getID();
   auto it = transactions_.find(txn->getID());
   DCHECK(it != transactions_.end());
-  TransactionInfo txnInfo = txn->getTransactionInfo();
 
   if (txn->isIngressPaused()) {
     // Someone detached a transaction that was paused.  Make the resumeIngress
@@ -1313,12 +1515,10 @@ HTTPSession::detach(HTTPTransaction* txn) noexcept {
 
   VLOG(4) << *this << " removing streamID=" << streamID <<
     ", liveTransactions was " << liveTransactions_;
-  CHECK(liveTransactions_ > 0);
+  CHECK_GT(liveTransactions_, 0);
   liveTransactions_--;
 
   if (txn->isPushed()) {
-    CHECK(pushedTxns_ > 0);
-    pushedTxns_--;
     auto assocTxn = findTransaction(txn->getAssocTxnId());
     if (assocTxn) {
       assocTxn->removePushedTransaction(streamID);
@@ -1330,14 +1530,14 @@ HTTPSession::detach(HTTPTransaction* txn) noexcept {
   if (transactions_.empty()) {
     latestActive_ = getCurrentTime();
     if (infoCallback_) {
-      infoCallback_->onDeactivateConnection(*this, txnInfo);
+      infoCallback_->onDeactivateConnection(*this);
     }
     if (getConnectionManager()) {
       getConnectionManager()->onDeactivated(*this);
     }
   } else {
     if (infoCallback_) {
-      infoCallback_->onTransactionDetached(*this, txnInfo);
+      infoCallback_->onTransactionDetached(*this);
     }
   }
 
@@ -1345,7 +1545,7 @@ HTTPSession::detach(HTTPTransaction* txn) noexcept {
     if (!codec_->supportsParallelRequests() && !transactions_.empty()) {
       // If we had more than one transaction, then someone tried to pipeline and
       // we paused reads
-      DCHECK(transactions_.size() == 1);
+      DCHECK_EQ(transactions_.size(), 1);
       auto& nextTxn = transactions_.begin()->second;
       DCHECK(nextTxn.isIngressPaused());
       DCHECK(!nextTxn.isIngressComplete());
@@ -1389,18 +1589,18 @@ HTTPSession::sendWindowUpdate(HTTPTransaction* txn,
 
 void
 HTTPSession::notifyIngressBodyProcessed(uint32_t bytes) noexcept {
-  CHECK(pendingReadSize_ >= bytes);
+  CHECK_GE(pendingReadSize_, bytes);
   auto oldSize = pendingReadSize_;
   pendingReadSize_ -= bytes;
   VLOG(4) << *this << " Dequeued " << bytes << " bytes of ingress. "
     << "Ingress buffer uses " << pendingReadSize_  << " of "
-    << kDefaultReadBufLimit << " bytes.";
+    << readBufLimit_ << " bytes.";
   if (connFlowControl_ &&
       connFlowControl_->ingressBytesProcessed(writeBuf_, bytes)) {
     scheduleWrite();
   }
-  if (oldSize > kDefaultReadBufLimit &&
-      pendingReadSize_ <= kDefaultReadBufLimit) {
+  if (oldSize > readBufLimit_ &&
+      pendingReadSize_ <= readBufLimit_) {
     resumeReads();
   }
 }
@@ -1410,7 +1610,10 @@ HTTPSession::notifyEgressBodyBuffered(int64_t bytes) noexcept {
   pendingWriteSizeDelta_ += bytes;
   // any net change requires us to update pause/resume state in the
   // loop callback
-  if (!isLoopCallbackScheduled()) {
+  if (pendingWriteSizeDelta_ > 0) {
+    // pause inline, resume in loop
+    updateWriteBufSize(0);
+  } else if (!isLoopCallbackScheduled()) {
     sock_->getEventBase()->runInLoop(this);
   }
 }
@@ -1433,7 +1636,7 @@ const TransportInfo& HTTPSession::getSetupTransportInfo() const noexcept {
 
 bool HTTPSession::getCurrentTransportInfoWithoutUpdate(
     TransportInfo* tinfo) const {
-  AsyncSocket* sock = dynamic_cast<AsyncSocket*>(sock_.get());
+  auto sock = sock_->getUnderlyingTransport<AsyncSocket>();
   if (sock) {
     tinfo->initWithSocket(sock);
     return true;
@@ -1445,12 +1648,12 @@ bool HTTPSession::getCurrentTransportInfo(TransportInfo* tinfo) {
   if (getCurrentTransportInfoWithoutUpdate(tinfo)) {
     // some fields are the same with the setup transport info
     tinfo->setupTime = transportInfo_.setupTime;
-    tinfo->ssl = transportInfo_.ssl;
+    tinfo->secure = transportInfo_.secure;
     tinfo->sslSetupTime = transportInfo_.sslSetupTime;
     tinfo->sslVersion = transportInfo_.sslVersion;
     tinfo->sslCipher = transportInfo_.sslCipher;
     tinfo->sslResume = transportInfo_.sslResume;
-    tinfo->sslNextProtocol = transportInfo_.sslNextProtocol;
+    tinfo->appProtocol = transportInfo_.appProtocol;
     tinfo->sslError = transportInfo_.sslError;
 #if defined(__linux__) || defined(__FreeBSD__)
     // update connection transport info with the latest RTT
@@ -1466,10 +1669,15 @@ bool HTTPSession::getCurrentTransportInfo(TransportInfo* tinfo) {
 }
 
 void HTTPSession::setByteEventTracker(
-    std::unique_ptr<ByteEventTracker> byteEventTracker) {
-  byteEventTracker_ = std::move(byteEventTracker);
-  byteEventTracker_->setCallback(this);
-  byteEventTracker_->setTTLBAStats(sessionStats_);
+    std::shared_ptr<ByteEventTracker> byteEventTracker) {
+  if (byteEventTracker && byteEventTracker_) {
+    byteEventTracker->absorb(std::move(*byteEventTracker_));
+  }
+  byteEventTracker_ = byteEventTracker;
+  if (byteEventTracker_) {
+    byteEventTracker_->setCallback(this);
+    byteEventTracker_->setTTLBAStats(sessionStats_);
+  }
 }
 
 unique_ptr<IOBuf> HTTPSession::getNextToSend(bool* cork, bool* eom) {
@@ -1484,19 +1692,56 @@ unique_ptr<IOBuf> HTTPSession::getNextToSend(bool* cork, bool* eom) {
   // We always tack on at least one body packet to the current write buf
   // This ensures that a short HTTPS response will go out in a single SSL record
   while (!txnEgressQueue_.empty()) {
-    uint32_t allowed = txnEgressQueue_.size() > 1 ? egressBodySizeLimit_ :
-      kWriteReadyMax;
+    uint32_t toSend = kWriteReadyMax;
     if (connFlowControl_) {
-      allowed = std::min(allowed, connFlowControl_->getAvailableSend());
-      if (allowed == 0) {
-        VLOG(4) << "Session-level send window is full, skipping "
+      if (connFlowControl_->getAvailableSend() == 0) {
+        VLOG(4) << "Session-level send window is full, skipping remaining "
                 << "body writes this loop";
         break;
       }
+      toSend = std::min(toSend, connFlowControl_->getAvailableSend());
     }
-    auto txn = txnEgressQueue_.top();
-    // returns true if there is more egress pending for this txn
-    if (txn->onWriteReady(allowed) || writeBuf_.front()) {
+    txnEgressQueue_.nextEgress(nextEgressResults_,
+                               isSpdyCodecProtocol(codec_->getProtocol()));
+    CHECK(!nextEgressResults_.empty()); // Queue was non empty, so this must be
+    // The maximum we will send for any transaction in this loop
+    uint32_t txnMaxToSend = toSend * nextEgressResults_.front().second;
+    if (txnMaxToSend == 0) {
+      // toSend is smaller than the number of transactions.  Give all egress
+      // to the first transaction
+      nextEgressResults_.erase(++nextEgressResults_.begin(),
+                               nextEgressResults_.end());
+      txnMaxToSend = std::min(toSend, egressBodySizeLimit_);
+      nextEgressResults_.front().second = 1;
+    }
+    if (nextEgressResults_.size() > 1 && txnMaxToSend > egressBodySizeLimit_) {
+      // Cap the max to egressBodySizeLimit_, and recompute toSend accordingly
+      txnMaxToSend = egressBodySizeLimit_;
+      toSend = txnMaxToSend / nextEgressResults_.front().second;
+    }
+    // split allowed by relative weight, with some minimum
+    for (auto txnPair: nextEgressResults_) {
+      uint32_t txnAllowed = txnPair.second * toSend;
+      if (nextEgressResults_.size() > 1) {
+        CHECK_LE(txnAllowed, egressBodySizeLimit_);
+      }
+      if (connFlowControl_) {
+        CHECK_LE(txnAllowed, connFlowControl_->getAvailableSend());
+      }
+      if (txnAllowed == 0) {
+        // The ratio * toSend was so small this txn gets nothing.
+        VLOG(4) << *this << " breaking egress loop on 0 txnAllowed";
+        break;
+      }
+
+      VLOG(4) << *this << " egressing txnID=" << txnPair.first->getID() <<
+        " allowed=" << txnAllowed;
+      txnPair.first->onWriteReady(txnAllowed, txnPair.second);
+    }
+    nextEgressResults_.clear();
+    // it can be empty because of HTTPTransaction rate limiting.  We should
+    // change rate limiting to clearPendingEgress while waiting.
+    if (!writeBuf_.empty()) {
       break;
     }
   }
@@ -1518,7 +1763,7 @@ unique_ptr<IOBuf> HTTPSession::getNextToSend(bool* cork, bool* eom) {
         }
         return writeBuf_.split(needed);
       } else {
-        CHECK(needed == writeBuf_.chainLength());
+        CHECK_EQ(needed, writeBuf_.chainLength());
       }
     }
   }
@@ -1570,7 +1815,7 @@ HTTPSession::runLoopCallback() noexcept {
     pendingWrites_.push_back(*segment);
     if (!writeTimeout_.isScheduled()) {
       // Any performance concern here?
-      transactionTimeouts_->scheduleTimeout(&writeTimeout_);
+      timeout_.scheduleTimeout(&writeTimeout_);
     }
     numActiveWrites_++;
     VLOG(4) << *this << " writing " << len << ", activeWrites="
@@ -1615,7 +1860,7 @@ HTTPSession::scheduleWrite() {
 }
 
 bool HTTPSession::egressLimitExceeded() const {
-  return pendingWriteSize_ >= kPendingWriteMax;
+  return pendingWriteSize_ >= writeBufLimit_;
 }
 
 void
@@ -1643,18 +1888,33 @@ HTTPSession::updateWriteBufSize(int64_t delta) {
 
   if (egressLimitExceeded() && !wasExceeded) {
     // Exceeded limit. Pause reading on the incoming stream.
-    VLOG(3) << "Pausing txn egress for " << *this;
-    invokeOnAllTransactions(&HTTPTransaction::pauseEgress);
+    if (inResume_) {
+      VLOG(3) << "Pausing txn egress for " << *this << " deferred";
+      pendingPause_ = true;
+    } else {
+      VLOG(3) << "Pausing txn egress for " << *this;
+      invokeOnAllTransactions(&HTTPTransaction::pauseEgress);
+    }
   } else if (!egressLimitExceeded() && wasExceeded) {
     // Dropped below limit. Resume reading on the incoming stream if needed.
-    VLOG(3) << "Resuming txn egress for " << *this;
-    invokeOnAllTransactions(&HTTPTransaction::resumeEgress);
+    if (inResume_) {
+      if (pendingPause_) {
+        VLOG(3) << "Cancel deferred txn egress pause for " << *this;
+        pendingPause_ = false;
+      } else {
+        VLOG(3) << "Ignoring redundant resume for " << *this;
+      }
+    } else {
+      VLOG(3) << "Resuming txn egress for " << *this;
+      resumeTransactions();
+    }
   }
 }
 
 void
 HTTPSession::shutdownTransport(bool shutdownReads,
-                               bool shutdownWrites) {
+                               bool shutdownWrites,
+                               const std::string& errorMsg) {
   DestructorGuard guard(this);
 
   // shutdowns not accounted for, shouldn't see any
@@ -1669,7 +1929,7 @@ HTTPSession::shutdownTransport(bool shutdownReads,
   bool notifyIngressShutdown = false;
 
   ProxygenError error;
-  if (transportInfo_.sslError) {
+  if (!transportInfo_.sslError.empty()) {
     error = kErrorSSL;
   } else if (sock_->error()) {
     VLOG(3) << "shutdown request for " << *this
@@ -1684,6 +1944,14 @@ HTTPSession::shutdownTransport(bool shutdownReads,
     error = kErrorTimeout;
   } else {
     error = kErrorEOF;
+  }
+
+  if (shutdownReads && !shutdownWrites && flowControlTimeout_.isScheduled()) {
+    // reads are dead and writes are blocked on a window update that will never
+    // come.  shutdown writes too.
+    VLOG(4) << *this << " Converting read shutdown to read/write due to"
+      " flow control";
+    shutdownWrites = true;
   }
 
   if (shutdownWrites && !writesShutdown()) {
@@ -1725,6 +1993,9 @@ HTTPSession::shutdownTransport(bool shutdownReads,
     } else if (error == kErrorEOF) {
       // Report to the codec that the ingress stream has ended
       codec_->onIngressEOF();
+      if (infoCallback_) {
+        infoCallback_->onIngressEOF();
+      }
     }
     // Once reads are shutdown the parser should stop processing
     codec_->setParserPaused(true);
@@ -1735,8 +2006,9 @@ HTTPSession::shutdownTransport(bool shutdownReads,
       HTTPException::Direction::INGRESS_AND_EGRESS :
       (notifyIngressShutdown ? HTTPException::Direction::INGRESS :
          HTTPException::Direction::EGRESS);
-    HTTPException ex(dir,
-      folly::to<std::string>("Shutdown transport: ", getErrorString(error)));
+    HTTPException ex(dir, folly::to<std::string>(
+        "Shutdown transport: ", getErrorString(error),
+        errorMsg.empty() ? "" : " ", errorMsg));
     ex.setProxygenError(error);
     invokeOnAllTransactions(&HTTPTransaction::onError, ex);
   }
@@ -1802,6 +2074,10 @@ HTTPSession::checkForShutdown() {
       !isLoopCallbackScheduled()) {
     VLOG(4) << "destroying " << *this;
     sock_->setReadCB(nullptr);
+    auto asyncSocket = sock_->getUnderlyingTransport<folly::AsyncSocket>();
+    if (asyncSocket) {
+      asyncSocket->setBufferCallback(nullptr);
+    }
     reads_ = SocketState::SHUTDOWN;
     if (resetSocketOnShutdown_) {
       sock_->closeWithReset();
@@ -1859,6 +2135,37 @@ size_t HTTPSession::sendPing() {
   return bytes;
 }
 
+HTTPCodec::StreamID HTTPSession::sendPriority(http2::PriorityUpdate pri) {
+  if (!codec_->supportsParallelRequests()) {
+    // For HTTP/1.1, don't call createStream()
+    return 0;
+  }
+  auto id = codec_->createStream();
+  sendPriority(id, pri);
+  return id;
+}
+
+size_t HTTPSession::sendPriority(HTTPCodec::StreamID id,
+                                 http2::PriorityUpdate pri) {
+  auto res = sendPriorityImpl(id, pri);
+  txnEgressQueue_.addOrUpdatePriorityNode(id, pri);
+  return res;
+}
+
+
+size_t HTTPSession::sendPriorityImpl(HTTPCodec::StreamID id,
+                                     http2::PriorityUpdate pri) {
+  CHECK_NE(id, 0);
+  const size_t bytes = codec_->generatePriority(
+    writeBuf_, id, std::make_tuple(pri.streamDependency,
+                                   pri.exclusive,
+                                   pri.weight));
+  if (bytes) {
+    scheduleWrite();
+  }
+  return bytes;
+}
+
 HTTPTransaction*
 HTTPSession::findTransaction(HTTPCodec::StreamID streamID) {
   auto it = transactions_.find(streamID);
@@ -1872,7 +2179,7 @@ HTTPSession::findTransaction(HTTPCodec::StreamID streamID) {
 HTTPTransaction*
 HTTPSession::createTransaction(HTTPCodec::StreamID streamID,
                                HTTPCodec::StreamID assocStreamID,
-                               int8_t priority) {
+                               http2::PriorityUpdate priority) {
   if (!sock_->good() || transactions_.count(streamID)) {
     // Refuse to add a transaction on a closing session or if a
     // transaction of that ID already exists.
@@ -1897,7 +2204,7 @@ HTTPSession::createTransaction(HTTPCodec::StreamID streamID,
     std::forward_as_tuple(streamID),
     std::forward_as_tuple(
       codec_->getTransportDirection(), streamID, transactionSeqNo_, *this,
-      txnEgressQueue_, transactionTimeouts_, sessionStats_,
+      txnEgressQueue_, timeout_, sessionStats_,
       codec_->supportsStreamFlowControl(),
       initialReceiveWindow_,
       getCodecSendWindowSize(),
@@ -1933,10 +2240,6 @@ HTTPSession::createTransaction(HTTPCodec::StreamID streamID,
     incomingStreams_++;
   }
 
-  if (txn->isPushed()) {
-    pushedTxns_++;
-  }
-
   return txn;
 }
 
@@ -1951,7 +2254,7 @@ HTTPSession::onWriteSuccess(uint64_t bytesWritten) {
     writeTimeout_.cancelTimeout();
   } else {
     VLOG(10) << "Refresh write timer on writeSuccess";
-    transactionTimeouts_->scheduleTimeout(&writeTimeout_);
+    timeout_.scheduleTimeout(&writeTimeout_);
   }
 
   if (infoCallback_) {
@@ -1960,10 +2263,13 @@ HTTPSession::onWriteSuccess(uint64_t bytesWritten) {
 
   VLOG(5) << "total bytesWritten_: " << bytesWritten_;
 
-  if (byteEventTracker_) {
-    byteEventTracker_->processByteEvents(bytesWritten_,
-                                         sock_->isEorTrackingEnabled());
-  }
+  // processByteEvents will return true if it has been replaced with another
+  // tracker in the middle and needs to be re-run.  Should happen at most
+  // once.  while with no body is intentional
+  while (byteEventTracker_ &&
+         byteEventTracker_->processByteEvents(
+           byteEventTracker_, bytesWritten_,
+           sock_->isEorTrackingEnabled())) {} // pass
 
   if ((!codec_->isReusable() || readsShutdown()) && (transactions_.empty())) {
     if (!codec_->isReusable()) {
@@ -1977,7 +2283,8 @@ HTTPSession::onWriteSuccess(uint64_t bytesWritten) {
   numActiveWrites_--;
   if (!inLoopCallback_) {
     updateWriteCount();
-    updateWriteBufSize(-bytesWritten); // safe to resume here
+    // safe to resume here:
+    updateWriteBufSize(-folly::to<int64_t>(bytesWritten));
     // PRIO_FIXME: this is done because of the corking business...
     //             in the future we may want to have a pull model
     //             whereby the socket asks us for a given amount of
@@ -1987,6 +2294,13 @@ HTTPSession::onWriteSuccess(uint64_t bytesWritten) {
     }
   }
   onWriteCompleted();
+
+  if (egressBytesLimit_ > 0 && bytesWritten_ >= egressBytesLimit_) {
+    VLOG(4) << "Egress limit reached, shutting down "
+      "session (egressed " << bytesWritten_ << ", limit set to "
+      << egressBytesLimit_ << ")";
+    shutdownTransport(true, true);
+  }
 }
 
 void
@@ -1997,9 +2311,10 @@ HTTPSession::onWriteError(size_t bytesWritten,
     infoCallback_->onWrite(*this, bytesWritten);
   }
 
+  auto sslEx = dynamic_cast<const folly::SSLException*>(&ex);
   // Save the SSL error, if there was one.  It will be recorded later
-  if (ERR_GET_LIB(ex.getErrno()) == ERR_LIB_SSL) {
-    transportInfo_.sslError = ERR_GET_REASON(ex.getErrno());
+  if (sslEx && sslEx->getSSLError() == folly::SSLError::SSL_ERROR) {
+    transportInfo_.sslError = ex.what();
   }
 
   setCloseReason(ConnectionCloseReason::IO_WRITE_ERROR);
@@ -2028,9 +2343,13 @@ HTTPSession::onWriteCompleted() {
 void HTTPSession::onSessionParseError(const HTTPException& error) {
   VLOG(4) << *this << " session layer parse error. Terminate the session.";
   if (error.hasCodecStatusCode()) {
+    std::unique_ptr<folly::IOBuf> errorMsg =
+      folly::IOBuf::copyBuffer(error.what());
     codec_->generateGoaway(writeBuf_,
                            codec_->getLastIncomingStreamID(),
-                           error.getCodecStatusCode());
+                           error.getCodecStatusCode(),
+                           isHTTP2CodecProtocol(codec_->getProtocol()) ?
+                           std::move(errorMsg) : nullptr);
     scheduleWrite();
   }
   setCloseReason(ConnectionCloseReason::SESSION_PARSE_ERROR);
@@ -2075,9 +2394,13 @@ HTTPSession::pauseReads() {
   codec_->setParserPaused(true);
   if (!readsUnpaused() ||
       (codec_->supportsParallelRequests() &&
-       pendingReadSize_ <= kDefaultReadBufLimit)) {
+       pendingReadSize_ <= readBufLimit_)) {
     return;
   }
+  pauseReadsImpl();
+}
+
+void HTTPSession::pauseReadsImpl() {
   VLOG(4) << *this << ": pausing reads";
   if (infoCallback_) {
     infoCallback_->onIngressPaused(*this);
@@ -2091,9 +2414,13 @@ void
 HTTPSession::resumeReads() {
   if (!readsPaused() ||
       (codec_->supportsParallelRequests() &&
-       pendingReadSize_ > kDefaultReadBufLimit)) {
+       pendingReadSize_ > readBufLimit_)) {
     return;
   }
+  resumeReadsImpl();
+}
+
+void HTTPSession::resumeReadsImpl() {
   VLOG(4) << *this << ": resuming reads";
   resetTimeout();
   reads_ = SocketState::UNPAUSED;
@@ -2154,6 +2481,30 @@ void HTTPSession::errorOnTransactionId(
   }
 }
 
+void HTTPSession::resumeTransactions() {
+  CHECK(!inResume_);
+  inResume_ = true;
+  DestructorGuard g(this);
+  auto resumeFn = [] (HTTP2PriorityQueue&, HTTPCodec::StreamID,
+                      HTTPTransaction *txn, double) {
+    if (txn) {
+      txn->resumeEgress();
+    }
+    return false;
+  };
+  auto stopFn = [this] {
+    return (transactions_.empty() || egressLimitExceeded());
+  };
+
+  txnEgressQueue_.iterateBFS(resumeFn, stopFn, true /* all */);
+  inResume_ = false;
+  if (pendingPause_) {
+    VLOG(3) << "Pausing txn egress for " << *this;
+    pendingPause_ = false;
+    invokeOnAllTransactions(&HTTPTransaction::pauseEgress);
+  }
+}
+
 void HTTPSession::onConnectionSendWindowOpen() {
   flowControlTimeout_.cancelTimeout();
   // We can write more now. Schedule a write.
@@ -2161,11 +2512,17 @@ void HTTPSession::onConnectionSendWindowOpen() {
 }
 
 void HTTPSession::onConnectionSendWindowClosed() {
+  if(!txnEgressQueue_.empty()) {
+    VLOG(4) << *this << " session stalled by flow control";
+    if (sessionStats_) {
+      sessionStats_->recordSessionStalled();
+    }
+  }
   DCHECK(!flowControlTimeout_.isScheduled());
   if (infoCallback_) {
     infoCallback_->onFlowControlWindowClosed(*this);
   }
-  transactionTimeouts_->scheduleTimeout(&flowControlTimeout_);
+  timeout_.scheduleTimeout(&flowControlTimeout_);
 }
 
 HTTPCodec::StreamID HTTPSession::getGracefulGoawayAck() const {
@@ -2211,6 +2568,26 @@ void HTTPSession::onDeleteAckEvent() {
   if (readsShutdown()) {
     shutdownTransport(true, transactions_.empty());
   }
+}
+
+void HTTPSession::onEgressBuffered() {
+  if (infoCallback_) {
+    infoCallback_->onEgressBuffered(*this);
+  }
+}
+
+void HTTPSession::onEgressBufferCleared() {
+  if (infoCallback_) {
+    infoCallback_->onEgressBufferCleared(*this);
+  }
+}
+
+void HTTPSession::onReplaySafe() noexcept {
+  sock_->setReplaySafetyCallback(nullptr);
+  for (auto callback : waitingForReplaySafety_) {
+    callback->onReplaySafe();
+  }
+  waitingForReplaySafety_.clear();
 }
 
 } // proxygen

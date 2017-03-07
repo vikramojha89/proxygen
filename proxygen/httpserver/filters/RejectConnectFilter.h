@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -85,7 +85,7 @@ class RejectConnectFilter : public Filter {
 
 class RejectConnectFilterFactory : public RequestHandlerFactory {
  public:
-  void onServerStart() noexcept override {
+  void onServerStart(folly::EventBase* evb) noexcept override {
   }
 
   void onServerStop() noexcept override {

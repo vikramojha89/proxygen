@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -490,14 +490,19 @@ class HTTPMessage {
    */
   const static int8_t kMaxPriority;
 
-  void setPriority(int8_t pri) {
+  static uint8_t normalizePriority(int8_t pri) {
     if (pri > kMaxPriority || pri < -kMaxPriority) {
       // outside [-7, 7] => highest priority
-      pri = kMaxPriority;
+      return kMaxPriority;
     } else if (pri < 0) {
-      pri = pri + kMaxPriority + 1;
+      return pri + kMaxPriority + 1;
     }
-    pri_ = pri;
+    return pri;
+  }
+
+  void setPriority(int8_t pri) {
+    pri_ = normalizePriority(pri);
+    h2Pri_ = boost::none;
   }
   uint8_t getPriority() const { return pri_; }
 
@@ -529,9 +534,10 @@ class HTTPMessage {
   }
 
   /**
-   * Get the time when the first byte of the message arrived
+   * Getter and setter for the time when the first byte of the message arrived
    */
   TimePoint getStartTime() const { return startTime_; }
+  void setStartTime(const TimePoint& startTime) { startTime_ = startTime; }
 
   /**
    * Check if a particular token value is present in a header that consists of

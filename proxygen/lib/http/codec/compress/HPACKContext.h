@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -17,8 +17,7 @@ namespace proxygen {
 
 class HPACKContext {
  public:
-  HPACKContext(HPACK::MessageType msgType,
-               uint32_t tableSize);
+  explicit HPACKContext(uint32_t tableSize);
   virtual ~HPACKContext() {}
 
   /**
@@ -50,6 +49,10 @@ class HPACKContext {
     return table_;
   }
 
+  void seedHeaderTable(std::vector<HPACKHeader>& headers);
+
+  void describe(std::ostream& os) const;
+
  protected:
   virtual const HeaderTable& getStaticTable() const {
     return StaticHeaderTable::get();
@@ -60,20 +63,21 @@ class HPACKContext {
   const HPACKHeader& getDynamicHeader(uint32_t index);
 
   virtual uint32_t globalToDynamicIndex(uint32_t index) const {
-    return index;
+    return index - getStaticTable().size();
   }
   virtual uint32_t globalToStaticIndex(uint32_t index) const {
-    return index - table_.size();
-  }
-  virtual uint32_t dynamicToGlobalIndex(uint32_t index) const {
     return index;
   }
+  virtual uint32_t dynamicToGlobalIndex(uint32_t index) const {
+    return index + getStaticTable().size();
+  }
   virtual uint32_t staticToGlobalIndex(uint32_t index) const {
-    return index + table_.size();
+    return index;
   }
 
   HeaderTable table_;
-  HPACK::MessageType msgType_;
 };
+
+std::ostream& operator<<(std::ostream& os, const HPACKContext& context);
 
 }

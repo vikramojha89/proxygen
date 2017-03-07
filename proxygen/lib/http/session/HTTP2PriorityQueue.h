@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,54 +9,193 @@
  */
 #pragma once
 
+#include <folly/IntrusiveList.h>
+#include <folly/io/async/HHWheelTimer.h>
+#include <proxygen/lib/http/codec/HTTP2Framer.h>
 #include <proxygen/lib/http/codec/HTTPCodec.h>
-#include <proxygen/lib/http/codec/experimental/HTTP2Framer.h>
+#include <proxygen/lib/utils/WheelTimerInstance.h>
 
 #include <list>
+#include <deque>
+#include <boost/intrusive/unordered_set.hpp>
 
 namespace proxygen {
 
 class HTTPTransaction;
 
-class HTTP2PriorityQueue {
+class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
 
  private:
   class Node;
+  using NodeMap = boost::intrusive::unordered_set<
+    Node, boost::intrusive::constant_time_size<false>>;
+
+  static const size_t kNumBuckets = 100;
 
  public:
 
   typedef Node* Handle;
 
+  HTTP2PriorityQueue()
+      : nodes_(NodeMap::bucket_traits(nodeBuckets_, kNumBuckets)) {
+    root_.setPermanent();
+  }
+
+  explicit HTTP2PriorityQueue(const WheelTimerInstance& timeout)
+      : nodes_(NodeMap::bucket_traits(nodeBuckets_, kNumBuckets)),
+        timeout_(timeout) {
+    root_.setPermanent();
+  }
+
+  void attachThreadLocals(const WheelTimerInstance& timeout);
+
+  void detachThreadLocals();
+
+  void setMaxVirtualNodes(uint32_t maxVirtualNodes) {
+    maxVirtualNodes_ = maxVirtualNodes;
+  }
+
+  // Notify the queue when a transaction has egress
+  void signalPendingEgress(Handle h);
+
+  // Notify the queue when a transaction no longer has egress
+  void clearPendingEgress(Handle h);
+
+  void addPriorityNode(HTTPCodec::StreamID id,
+                       HTTPCodec::StreamID parent) override{
+    addTransaction(id, {parent, false, 0}, nullptr, true);
+  }
+
+  void addOrUpdatePriorityNode(HTTPCodec::StreamID id,
+                               http2::PriorityUpdate pri);
+
+  void dropPriorityNodes() {
+    root_.dropPriorityNodes();
+  }
+
+  // adds new transaction (possibly nullptr) to the priority tree
+  Handle addTransaction(HTTPCodec::StreamID id, http2::PriorityUpdate pri,
+                        HTTPTransaction *txn, bool permanent = false,
+                        uint64_t* depth = nullptr);
+
+  // update the priority of an existing node
+  Handle updatePriority(
+      Handle handle,
+      http2::PriorityUpdate pri,
+      uint64_t* depth = nullptr);
+
+  // Remove the transaction from the priority tree
+  void removeTransaction(Handle handle);
+
+  // Returns true if there are no transaction with pending egress
+  bool empty() const {
+    return activeCount_ == 0;
+  }
+
+  // The number with pending egress
+  uint64_t numPendingEgress() const {
+    return activeCount_;
+  }
+
+  void iterate(const std::function<bool(HTTPCodec::StreamID,
+                                        HTTPTransaction *, double)>& fn,
+               const std::function<bool()>& stopFn, bool all) {
+    updateEnqueuedWeight();
+    root_.iterate(fn, stopFn, all);
+  }
+
+  // stopFn is only evaluated once per level
+  void iterateBFS(const std::function<bool(HTTP2PriorityQueue&,
+                                           HTTPCodec::StreamID,
+                                           HTTPTransaction *, double)>& fn,
+                  const std::function<bool()>& stopFn, bool all);
+
+  typedef std::vector<std::pair<HTTPTransaction*, double>> NextEgressResult;
+
+  void nextEgress(NextEgressResult& result, bool spdyMode = false);
+
+  static void setNodeLifetime(std::chrono::milliseconds lifetime) {
+    kNodeLifetime_ = lifetime;
+  }
+
+  /// Error handling code
+  // Rebuilds tree by making all non-root nodes direct children of the root and
+  // weight reset to the default 16
+  void rebuildTree();
+  uint32_t getRebuildCount() const { return rebuildCount_; }
+  bool isRebuilt() const { return rebuildCount_ > 0; }
+
+
  private:
+  // Find the node in priority tree
+  Handle find(HTTPCodec::StreamID id, uint64_t* depth = nullptr);
 
-  class Node {
+  Handle findInternal(HTTPCodec::StreamID id) {
+    if (id == 0) {
+      return &root_;
+    }
+    return find(id);
+  }
+
+  bool allowDanglingNodes() const {
+    return timeout_ && kNodeLifetime_.count() > 0;
+  }
+
+  void scheduleNodeExpiration(Node *node) {
+    if (timeout_) {
+      VLOG(5) << "scheduling expiration for node=" << node->getID();
+      DCHECK_GT(kNodeLifetime_.count(), 0);
+      timeout_.scheduleTimeout(node, kNodeLifetime_);
+    }
+  }
+
+  static bool nextEgressResult(HTTP2PriorityQueue& queue,
+                               HTTPCodec::StreamID id, HTTPTransaction* txn,
+                               double r);
+
+  void updateEnqueuedWeight();
+
+ private:
+  typedef boost::intrusive::link_mode<boost::intrusive::auto_unlink> link_mode;
+
+  class Node : public folly::HHWheelTimer::Callback,
+               public boost::intrusive::unordered_set_base_hook<link_mode> {
    public:
-    Node(Node* inParent, HTTPCodec::StreamID id,
-         uint32_t weight, HTTPTransaction *txn)
-      : parent_(inParent),
-        id_(id),
-        weight_(weight),
-        txn_(txn) {
-    }
+    Node(HTTP2PriorityQueue& queue, Node* inParent, HTTPCodec::StreamID id,
+         uint8_t weight, HTTPTransaction *txn);
 
-    Handle addChild(std::unique_ptr<Node> child) {
-      child->parent_ = this;
-      totalChildWeight_ += child->weight_;
-      Node* raw = child.get();
-      children_.push_back(std::move(child));
-      raw->self_ = lastChild();
-      return raw;
-    }
+    ~Node();
 
-    void addChildren(std::list<std::unique_ptr<Node>>&& children) {
-      std::list<std::unique_ptr<Node>> emptyChilden;
-      for (auto& child: children) {
-        addChild(std::move(child));
+    // Functor comparing id to node and vice-versa
+    struct IdNodeEqual {
+      bool operator()(const HTTPCodec::StreamID& id, const Node& node) {
+        return id == node.id_;
       }
-      std::swap(children, emptyChilden);
+      bool operator()(const Node& node, const HTTPCodec::StreamID& id) {
+        return node.id_ == id;
+      }
+    };
+
+    // Hash function
+    struct IdHash {
+      size_t operator()(const HTTPCodec::StreamID& id) const {
+        return boost::hash<HTTPCodec::StreamID>()(id);
+      }
+    };
+
+    // Equality and hash operators (for intrusive set)
+    friend bool operator==(const Node& lhs, const Node& rhs) {
+      return lhs.id_ == rhs.id_;
+    }
+    friend std::size_t hash_value(const Node& node) {
+      return IdHash()(node.id_);
     }
 
-    Node* parent() const {
+    void setPermanent() {
+      isPermanent_ = true;
+    }
+
+    Node* getParent() const {
       return parent_;
     }
 
@@ -75,105 +214,37 @@ class HTTP2PriorityQueue {
       return txn_;
     }
 
-    std::list<std::unique_ptr<Node>>::iterator lastChild() {
-      auto it = children_.rbegin();
-      it++;
-      std::list<std::unique_ptr<Node>>::iterator result = it.base();
-      return result;
+    void clearTransaction() {
+      txn_ = nullptr;
     }
 
     // Add a new node as a child of this node
-    Handle emplaceNode(std::unique_ptr<Node> node, bool exclusive) {
-      std::list<std::unique_ptr<Node>> children;
-      if (exclusive) {
-        // this->children become new node's children
-        std::swap(children, children_);
-        totalChildWeight_ = 0;
-        totalEnqueuedWeight_ = 0;
-      }
-      node->addChildren(std::move(children));
-      auto res = addChild(std::move(node));
-      return res;
-    }
+    Handle emplaceNode(std::unique_ptr<Node> node, bool exclusive);
 
-    std::unique_ptr<Node> detachChild(HTTPCodec::StreamID id) {
-      auto it = std::find_if(children_.begin(), children_.end(),
-                             [id] (const std::unique_ptr<Node>& n) {
-                               return n->id_ == id; });
-      if (it == children_.end()) {
-        CHECK(false) << "Detach non-child id=" << id;
-      }
-      return detachChild(it->get());
-    }
+    // Removes the node from the tree
+    void removeFromTree();
 
-    std::unique_ptr<Node> detachChild(Node* node) {
-      totalChildWeight_ -= node->weight_;
-      auto it = node->self_;
-      auto res = std::move(*node->self_);
-      children_.erase(it);
-      return res;
-    }
+    void signalPendingEgress();
 
-    Handle reparent(Node* newParent, bool exclusive) {
-      auto self = parent_->detachChild(this);
-      parent_ = newParent;
-      (void)newParent->emplaceNode(std::move(self), exclusive);
-      return this;
-    }
+    void clearPendingEgress();
+
+    // Set a new weight for this node
+    void updateWeight(uint8_t weight);
+
+    Handle reparent(Node* newParent, bool exclusive);
 
     // Returns true if this is a descendant of node
-    bool isDescendantOf(Node *node) {
-      Node* cur = parent_;
-      while (cur) {
-        if (cur->id_ == node->id_) {
-          return true;
-        }
-        cur = cur->parent_;
-      }
-      return false;
-    }
+    bool isDescendantOf(Node *node) const;
 
     // True if this Node is in the egress queue
     bool isEnqueued() const {
       return (txn_ != nullptr && enqueued_);
     }
 
-    void signalPendingEgress() {
-      enqueued_ = true;
-    }
-
-    void clearPendingEgress() {
-      CHECK(enqueued_);
-      enqueued_ = false;
-    }
-
-    // Set a new weight for this node
-    void updateWeight(uint8_t weight) {
-      int16_t delta = weight - weight_;
-      weight_ = weight;
-      parent_->totalChildWeight_ += delta;
-    }
-
-    // Removes the node from the tree
-    void removeFromTree() {
-      // move my children to my parent
-      parent_->addChildren(std::move(children_));
-      (void)parent_->detachChild(this);
-    }
-
-    // Find the node for the given stream ID in the priority tree
-    Node* findInTree(HTTPCodec::StreamID id) {
-      if (id_ == id) {
-        return this;
-      }
-      Node* res = nullptr;
-      for (auto& child: children_) {
-        res = child->findInTree(id);
-        if (res) {
-          break;
-        }
-      }
-      return res;
+    // True if this Node is in the egress tree even if the node itself is
+    // virtual but has enqueued descendants.
+    bool inEgressTree() const {
+      return isEnqueued() || totalEnqueuedWeight_ > 0;
     }
 
     double getRelativeWeight() const {
@@ -181,7 +252,7 @@ class HTTP2PriorityQueue {
         return 1.0;
       }
 
-      return (double)weight_ / parent_->totalChildWeight_;
+      return static_cast<double>(weight_) / parent_->totalChildWeight_;
     }
 
     double getRelativeEnqueuedWeight() const {
@@ -189,7 +260,11 @@ class HTTP2PriorityQueue {
         return 1.0;
       }
 
-      return (double)weight_ / parent_->totalEnqueuedWeight_;
+      if (parent_->totalEnqueuedWeight_ == 0) {
+        return 0.0;
+      }
+
+      return static_cast<double>(weight_) / parent_->totalEnqueuedWeight_;
     }
 
     /* Execute the given function on this node and all child nodes presently
@@ -205,228 +280,96 @@ class HTTP2PriorityQueue {
      */
     bool iterate(const std::function<bool(HTTPCodec::StreamID,
                                           HTTPTransaction *, double)>& fn,
-                 const std::function<bool()>& stopFn, bool all) {
-      bool stop = false;
-      if (stopFn()) {
-        return true;
-      }
-      if (parent_ /* exclude root */  && (all || isEnqueued())) {
-        stop = fn(id_, txn_, getRelativeWeight());
-      }
-      for (auto& child: children_) {
-        if (stop || stopFn()) {
-          return true;
-        }
-        stop = child->iterate(fn, stopFn, all);
-      }
-      return stop;
-    }
+                 const std::function<bool()>& stopFn, bool all);
 
-    typedef std::list<std::pair<HTTPCodec::StreamID, double>> PendingList;
+    struct PendingNode {
+      HTTPCodec::StreamID id;
+      Node* node;
+      double ratio;
+      PendingNode(HTTPCodec::StreamID i, Node* n, double r) :
+          id(i), node(n), ratio(r) {}
+    };
+
+    typedef std::deque<PendingNode> PendingList;
     bool visitBFS(double relativeParentWeight,
-                  const std::function<bool(HTTPCodec::StreamID,
-                                          HTTPTransaction *, double)>& fn,
+                  const std::function<bool(HTTP2PriorityQueue& queue,
+                                           HTTPCodec::StreamID,
+                                           HTTPTransaction *, double)>& fn,
                   bool all,
-                  PendingList& pendingNodes) {
-      bool invoke = (parent_ != nullptr && (all || isEnqueued()));
+                  PendingList& pendingNodes, bool enqueuedChildren);
 
-      // Add children when all==true, or for any not invoked node with
-      // pending children
-      if (all || (!invoke && totalEnqueuedWeight_ > 0)) {
-        for (auto& child: children_) {
-          pendingNodes.push_back({child->id_,
-                relativeParentWeight * getRelativeEnqueuedWeight()});
-        }
-      }
+    void updateEnqueuedWeight(bool activeNodes);
 
-      // Invoke fn last in case it deletes this node
-      if (invoke && fn(id_, txn_,
-                       relativeParentWeight * getRelativeEnqueuedWeight())) {
-        return true;
-      }
+    void dropPriorityNodes();
 
-      return false;
-    }
+    void convertVirtualNode(HTTPTransaction* txn);
 
-    void updateEnqueuedWeight() {
-      totalEnqueuedWeight_ = totalChildWeight_;
-      for (auto& child: children_) {
-        child->updateEnqueuedWeight();
-      }
-      if (totalEnqueuedWeight_ == 0 && !isEnqueued()) {
-        parent_->totalEnqueuedWeight_ -= weight_;
-      }
-    }
+    uint64_t calculateDepth() const;
+
+    // Internal error recovery
+    void flattenSubtree();
+    void flattenSubtreeDFS(Node* subtreeRoot);
+    static void addChildToNewSubtreeRoot(std::unique_ptr<Node> child,
+                                         Node* subtreeRoot);
 
    private:
+    Handle addChild(std::unique_ptr<Node> child);
+
+    void addChildren(std::list<std::unique_ptr<Node>>&& children);
+
+    std::unique_ptr<Node> detachChild(Node* node);
+
+    void addEnqueuedChild(HTTP2PriorityQueue::Node* node);
+
+    void removeEnqueuedChild(HTTP2PriorityQueue::Node* node);
+
+    static void propagatePendingEgressSignal(Node *node);
+
+    static void propagatePendingEgressClear(Node* node);
+
+    void timeoutExpired() noexcept override {
+      VLOG(5) << "Node=" << id_ << " expired";
+      CHECK(txn_ == nullptr);
+      removeFromTree();
+    }
+
+    void refreshTimeout() {
+      if (!txn_ && !isPermanent_ && isScheduled()) {
+        queue_.scheduleNodeExpiration(this);
+      }
+    }
+
+    HTTP2PriorityQueue& queue_;
     Node *parent_{nullptr};
     HTTPCodec::StreamID id_{0};
-    uint8_t weight_{16};
+    uint16_t weight_{16};
     HTTPTransaction *txn_{nullptr};
+    bool isPermanent_{false};
     bool enqueued_{false};
+#ifndef NDEBUG
+    uint64_t totalEnqueuedWeightCheck_{0};
+#endif
     uint64_t totalEnqueuedWeight_{0};
     uint64_t totalChildWeight_{0};
     std::list<std::unique_ptr<Node>> children_;
     std::list<std::unique_ptr<Node>>::iterator self_;
+    folly::IntrusiveListHook enqueuedHook_;
+    folly::IntrusiveList<Node, &Node::enqueuedHook_> enqueuedChildren_;
   };
 
- public:
-  HTTP2PriorityQueue() {}
-
-  // Find the node in priority tree
-  Node* find(HTTPCodec::StreamID id) {
-    if (id == 0) {
-      return nullptr;
-    }
-    return root_.findInTree(id);
-  }
-
-  // Notify the queue when a transaction has egress
-  void signalPendingEgress(Handle h) {
-    if (!h->isEnqueued()) {
-      h->signalPendingEgress();
-      activeCount_++;
-    }
-  }
-
-  // Notify the queue when a transaction no longer has egress
-  void clearPendingEgress(Handle h) {
-    CHECK(activeCount_ > 0);
-    // clear does a CHECK on h->isEnqueued()
-    h->clearPendingEgress();
-    activeCount_--;
-  }
-
-  // adds new transaction (possibly nullptr) to the priority tree
-  Handle addTransaction(HTTPCodec::StreamID id, http2::PriorityUpdate pri,
-                        HTTPTransaction *txn) {
-    CHECK(id != 0);
-
-    Node* parent = &root_;
-    if (pri.streamDependency != 0) {
-      Node* dep = find(pri.streamDependency);
-      if (dep == nullptr) {
-        // specified a missing parent (timed out an idle node)?
-        LOG(INFO) << "assigning default priority to txn=" << id;
-      } else {
-        parent = dep;
-      }
-    }
-    auto node = folly::make_unique<Node>(parent, id, pri.weight, txn);
-    auto result = parent->emplaceNode(std::move(node), pri.exclusive);
-    return result;
-  }
-
-  // update the priority of an existing node
-  Handle updatePriority(Handle handle, http2::PriorityUpdate pri) {
-    Node* node = handle;
-    node->updateWeight(pri.weight);
-    if (pri.streamDependency == node->parentID() && !pri.exclusive) {
-      // no move
-      return handle;
-    }
-
-    Node* newParent = find(pri.streamDependency);
-    if (!newParent) {
-      newParent = &root_;
-    }
-
-    if (newParent->isDescendantOf(node)) {
-      newParent = newParent->reparent(node->parent(), false);
-    }
-    return node->reparent(newParent, pri.exclusive);
-  }
-
-  // Remove the transaction from the priority tree
-  void removeTransaction(Handle handle) {
-    Node* node = handle;
-    // TODO: or require the node to do it?
-    if (node->isEnqueued()) {
-      clearPendingEgress(handle);
-    }
-    node->removeFromTree();
-  }
-
-  // Returns true if there are no transaction with pending egress
-  bool empty() const {
-    return activeCount_ == 0;
-  }
-
-  // The number with pending egress
-  uint64_t numPendingEgress() const {
-    return activeCount_;
-  }
-
-  void iterate(const std::function<bool(HTTPCodec::StreamID,
-                                        HTTPTransaction *, double)>& fn,
-               const std::function<bool()>& stopFn, bool all) {
-    root_.iterate(fn, stopFn, all);
-  }
-
-  // stopFn is only evaluated once per level
-  void iterateBFS(const std::function<bool(HTTPCodec::StreamID,
-                                           HTTPTransaction *, double)>& fn,
-                  const std::function<bool()>& stopFn, bool all) {
-    Node::PendingList pendingNodes{{0, 1.0}};
-    Node::PendingList newPendingNodes;
-    bool stop = false;
-    while (!stop && !stopFn() && !pendingNodes.empty()) {
-      CHECK(newPendingNodes.empty());
-      while (!stop && !pendingNodes.empty()) {
-        Node* node = findInternal(pendingNodes.front().first);
-        if (node) {
-          stop = node->visitBFS(pendingNodes.front().second, fn, all,
-                                newPendingNodes);
-        }
-        pendingNodes.pop_front();
-      }
-      std::swap(pendingNodes, newPendingNodes);
-    }
-  }
-
-  struct WeightCmp {
-    bool operator()(const std::pair<HTTPTransaction*, double>& t1,
-                    const std::pair<HTTPTransaction*, double>& t2) {
-      return t1.second > t2.second;
-    }
-  };
-
-
-  std::list<std::pair<HTTPTransaction*, double>> nextEgress() {
-    std::list<std::pair<HTTPTransaction*, double>> result;
-    auto fn = [&result] (HTTPCodec::StreamID id, HTTPTransaction* txn,
-                         double r) {
-      result.push_back({txn, r});
-      return false;
-    };
-
-    root_.updateEnqueuedWeight();
-
-    Node::PendingList pendingNodes{{0, 1.0}};
-    bool stop = false;
-    while (!stop && !pendingNodes.empty()) {
-      Node* node = findInternal(pendingNodes.front().first);
-      if (node) {
-        stop = node->visitBFS(pendingNodes.front().second, fn, false,
-                              pendingNodes);
-      }
-      pendingNodes.pop_front();
-    }
-    result.sort(WeightCmp());
-    return result;
-  }
-
- private:
-  Node* findInternal(HTTPCodec::StreamID id) {
-    if (id == 0) {
-      return &root_;
-    }
-    return root_.findInTree(id);
-  }
-
-  Node root_{nullptr, 0, 1, nullptr};
+  typename NodeMap::bucket_type nodeBuckets_[kNumBuckets];
+  NodeMap nodes_;
+  Node root_{*this, nullptr, 0, 1, nullptr};
+  uint32_t rebuildCount_{0};
+  static uint32_t kMaxRebuilds_;
   uint64_t activeCount_{0};
-};
+  uint32_t maxVirtualNodes_{50};
+  uint32_t numVirtualNodes_{0};
+  bool pendingWeightChange_{false};
+  WheelTimerInstance timeout_;
 
+  NextEgressResult* nextEgressResults_{nullptr};
+  static std::chrono::milliseconds kNodeLifetime_;
+};
 
 }

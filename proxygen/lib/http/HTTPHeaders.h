@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,6 +12,7 @@
 #include <folly/FBVector.h>
 #include <folly/Range.h>
 #include <proxygen/lib/http/HTTPCommonHeaders.h>
+#include <proxygen/lib/utils/Export.h>
 #include <proxygen/lib/utils/UtilInl.h>
 
 #include <bitset>
@@ -71,12 +72,12 @@ class HTTPHeaders {
    */
   static const std::string COMBINE_SEPARATOR;
 
-  HTTPHeaders();
-  ~HTTPHeaders();
-  HTTPHeaders (const HTTPHeaders&);
-  HTTPHeaders& operator= (const HTTPHeaders&);
-  HTTPHeaders (HTTPHeaders&&) noexcept;
-  HTTPHeaders& operator= (HTTPHeaders&&);
+  FB_EXPORT HTTPHeaders();
+  FB_EXPORT ~HTTPHeaders();
+  FB_EXPORT HTTPHeaders (const HTTPHeaders&);
+  FB_EXPORT HTTPHeaders& operator= (const HTTPHeaders&);
+  FB_EXPORT HTTPHeaders (HTTPHeaders&&) noexcept;
+  FB_EXPORT HTTPHeaders& operator= (HTTPHeaders&&);
 
   /**
    * Add the header 'name' with value 'value'; if other instances of this
@@ -265,8 +266,6 @@ class HTTPHeaders {
    * moved.
    */
   bool transferHeaderIfPresent(folly::StringPiece name, HTTPHeaders& dest);
-
-  static void initGlobals() __attribute__ ((__constructor__));
 
   // deletes the strings in headerNames_ that we own
   void disposeOfHeaderNames();

@@ -22,6 +22,7 @@ nobase_libproxygenhttp_HEADERS = \
 	HTTPMessageFilters.h \
 	HTTPMethod.h \
 	ProxygenErrorEnum.h \
+	experimental/RFC1867.h \
 	RFC2616.h \
 	Window.h \
 	codec/CodecDictionaries.h \
@@ -31,6 +32,7 @@ nobase_libproxygenhttp_HEADERS = \
 	codec/HTTP1xCodec.h \
 	codec/HTTPChecks.h \
 	codec/HTTPCodec.h \
+	codec/HTTPCodecFactory.h \
 	codec/HTTPCodecFilter.h \
 	codec/HTTPCodecPrinter.h \
 	codec/HTTPSettings.h \
@@ -58,21 +60,15 @@ nobase_libproxygenhttp_HEADERS = \
 	codec/compress/Huffman.h \
 	codec/compress/Logging.h \
 	codec/compress/StaticHeaderTable.h \
-	codec/compress/experimental/hpack9/HPACKCodec.h \
-	codec/compress/experimental/hpack9/HPACKConstants.h \
-	codec/compress/experimental/hpack9/HPACKContextImpl.h \
-	codec/compress/experimental/hpack9/HPACKDecoder.h \
-	codec/compress/experimental/hpack9/HPACKEncoder.h \
-	codec/compress/experimental/hpack9/Huffman.h \
-	codec/compress/experimental/hpack9/StaticHeaderTable.h \
-	codec/experimental/HTTPRequestVerifier.h \
-	codec/experimental/HTTP2Codec.h \
-	codec/experimental/HTTP2Constants.h \
-	codec/experimental/HTTP2Framer.h \
+	codec/HTTPRequestVerifier.h \
+	codec/HTTP2Codec.h \
+	codec/HTTP2Constants.h \
+	codec/HTTP2Framer.h \
 	session/AckLatencyEvent.h \
 	session/ByteEventTracker.h \
 	session/ByteEvents.h \
 	session/CodecErrorResponseHandler.h \
+	session/HTTPDefaultSessionCodecFactory.h \
 	session/HTTPDirectResponseHandler.h \
 	session/HTTPDownstreamSession.h \
 	session/HTTPErrorPage.h \
@@ -85,6 +81,7 @@ nobase_libproxygenhttp_HEADERS = \
 	session/HTTPTransactionEgressSM.h \
 	session/HTTPTransactionIngressSM.h \
 	session/HTTPUpstreamSession.h \
+	session/HTTP2PriorityQueue.h \
 	session/SimpleController.h \
 	session/TTLBAStats.h \
 	session/TransportFilter.h
@@ -104,18 +101,14 @@ libproxygenhttp_la_SOURCES = \
 	codec/compress/Huffman.cpp \
 	codec/compress/Logging.cpp \
 	codec/compress/StaticHeaderTable.cpp \
-	codec/compress/experimental/hpack9/HPACKCodec.cpp \
-	codec/compress/experimental/hpack9/HPACKDecoder.cpp \
-	codec/compress/experimental/hpack9/HPACKEncoder.cpp \
-	codec/compress/experimental/hpack9/Huffman.cpp \
-	codec/compress/experimental/hpack9/StaticHeaderTable.cpp \
 	codec/ErrorCode.cpp \
-	codec/experimental/HTTP2Codec.cpp \
-	codec/experimental/HTTP2Constants.cpp \
-	codec/experimental/HTTP2Framer.cpp \
+	codec/HTTP2Codec.cpp \
+	codec/HTTP2Constants.cpp \
+	codec/HTTP2Framer.cpp \
 	codec/FlowControlFilter.cpp \
 	codec/HTTP1xCodec.cpp \
 	codec/HTTPChecks.cpp \
+	codec/HTTPCodecFactory.cpp \
 	codec/HTTPCodecFilter.cpp \
 	codec/HTTPCodecPrinter.cpp \
 	codec/HTTPSettings.cpp \
@@ -132,9 +125,11 @@ libproxygenhttp_la_SOURCES = \
 	HTTPMessage.cpp \
 	HTTPMethod.cpp \
 	ProxygenErrorEnum.cpp \
+	experimental/RFC1867.cpp \
 	RFC2616.cpp \
 	session/ByteEvents.cpp \
 	session/CodecErrorResponseHandler.cpp \
+	session/HTTPDefaultSessionCodecFactory.cpp \
 	session/HTTPDirectResponseHandler.cpp \
 	session/HTTPDownstreamSession.cpp \
 	session/HTTPErrorPage.cpp \
@@ -153,5 +148,4 @@ libproxygenhttp_la_SOURCES = \
 
 libproxygenhttp_la_LIBADD = \
 	../services/libproxygenservices.la \
-	../ssl/libproxygenssl.la \
 	../utils/libutils.la

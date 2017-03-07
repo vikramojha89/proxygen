@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -110,6 +110,10 @@ class Filter : public RequestHandler, public ResponseHandler {
 
   void resumeIngress() noexcept override {
     downstream_->resumeIngress();
+  }
+
+  ResponseHandler* newPushedResponse(PushHandler* handler) noexcept override {
+    return downstream_->newPushedResponse(handler);
   }
 
   const wangle::TransportInfo& getSetupTransportInfo() const noexcept override {

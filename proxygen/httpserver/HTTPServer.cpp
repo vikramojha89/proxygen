@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -15,6 +15,8 @@
 #include <proxygen/httpserver/SignalHandler.h>
 #include <proxygen/httpserver/filters/RejectConnectFilter.h>
 #include <proxygen/httpserver/filters/ZlibServerFilter.h>
+#include <wangle/concurrent/NamedThreadFactory.h>
+#include <wangle/ssl/SSLContextManager.h>
 
 using folly::AsyncServerSocket;
 using folly::EventBase;
@@ -28,20 +30,29 @@ namespace proxygen {
 class AcceptorFactory : public wangle::AcceptorFactory {
  public:
   AcceptorFactory(std::shared_ptr<HTTPServerOptions> options,
-                  AcceptorConfiguration config) :
+                  std::shared_ptr<HTTPCodecFactory> codecFactory,
+                  AcceptorConfiguration config,
+                  HTTPSession::InfoCallback* sessionInfoCb) :
       options_(options),
-      config_(config)  {}
+      codecFactory_(codecFactory),
+      config_(config),
+      sessionInfoCb_(sessionInfoCb) {}
   std::shared_ptr<wangle::Acceptor> newAcceptor(
       folly::EventBase* eventBase) override {
     auto acc = std::shared_ptr<HTTPServerAcceptor>(
-      HTTPServerAcceptor::make(config_, *options_).release());
+      HTTPServerAcceptor::make(config_, *options_, codecFactory_).release());
+    if (sessionInfoCb_) {
+      acc->setSessionInfoCallback(sessionInfoCb_);
+    }
     acc->init(nullptr, eventBase);
     return acc;
   }
 
  private:
   std::shared_ptr<HTTPServerOptions> options_;
+  std::shared_ptr<HTTPCodecFactory> codecFactory_;
   AcceptorConfiguration config_;
+  HTTPSession::InfoCallback* sessionInfoCb_;
 };
 
 HTTPServer::HTTPServer(HTTPServerOptions options):
@@ -79,9 +90,10 @@ class HandlerCallbacks : public ThreadPoolExecutor::Observer {
   explicit HandlerCallbacks(std::shared_ptr<HTTPServerOptions> options) : options_(options) {}
 
   void threadStarted(ThreadPoolExecutor::ThreadHandle* h) override {
-    IOThreadPoolExecutor::getEventBase(h)->runInEventBaseThread([&](){
+    auto evb = IOThreadPoolExecutor::getEventBase(h);
+    evb->runInEventBaseThread([=](){
       for (auto& factory: options_->handlerFactories) {
-        factory->onServerStart();
+        factory->onServerStart(evb);
       }
     });
   }
@@ -103,21 +115,39 @@ void HTTPServer::start(std::function<void()> onSuccess,
   mainEventBase_ = EventBaseManager::get()->getEventBase();
 
   auto accExe = std::make_shared<IOThreadPoolExecutor>(1);
-  auto exe = std::make_shared<IOThreadPoolExecutor>(options_->threads);
+  auto exe = std::make_shared<IOThreadPoolExecutor>(options_->threads,
+    std::make_shared<wangle::NamedThreadFactory>("HTTPSrvExec"));
   auto exeObserver = std::make_shared<HandlerCallbacks>(options_);
   // Observer has to be set before bind(), so onServerStart() callbacks run
   exe->addObserver(exeObserver);
 
   try {
     FOR_EACH_RANGE (i, 0, addresses_.size()) {
+      auto codecFactory = addresses_[i].codecFactory;
+      auto accConfig = HTTPServerAcceptor::makeConfig(addresses_[i], *options_);
       auto factory = std::make_shared<AcceptorFactory>(
         options_,
-        HTTPServerAcceptor::makeConfig(addresses_[i], *options_));
+        codecFactory,
+        accConfig,
+        sessionInfoCb_);
       bootstrap_.push_back(
           wangle::ServerBootstrap<wangle::DefaultPipeline>());
       bootstrap_[i].childHandler(factory);
+      if (accConfig.enableTCPFastOpen) {
+        // We need to do this because wangle's bootstrap has 2 acceptor configs
+        // and the socketConfig gets passed to the SocketFactory. The number of
+        // configs should really be one, and when that happens, we can remove
+        // this code path.
+        bootstrap_[i].socketConfig.enableTCPFastOpen = true;
+        bootstrap_[i].socketConfig.fastOpenQueueSize =
+            accConfig.fastOpenQueueSize;
+      }
       bootstrap_[i].group(accExe, exe);
-      bootstrap_[i].bind(addresses_[i].address);
+      if (options_->preboundSockets_.size() > 0) {
+        bootstrap_[i].bind(std::move(options_->preboundSockets_[i]));
+      } else {
+        bootstrap_[i].bind(addresses_[i].address);
+      }
     }
   } catch (const std::exception& ex) {
     stop();
@@ -136,19 +166,27 @@ void HTTPServer::start(std::function<void()> onSuccess,
     signalHandler_->install(options_->shutdownOn);
   }
 
-  // Start the main event loop
+  // Start the main event loop.
   if (onSuccess) {
-    onSuccess();
+    mainEventBase_->runInLoop([onSuccess(std::move(onSuccess))]() {
+      // IMPORTANT: Since we may be racing with stop(), we must assume that
+      // mainEventBase_ can become null the moment that onSuccess is called,
+      // so this **has** to be queued to run from inside loopForever().
+        onSuccess();
+    });
   }
   mainEventBase_->loopForever();
 }
 
-void HTTPServer::stop() {
+void HTTPServer::stopListening() {
   CHECK(mainEventBase_);
-
   for (auto& bootstrap : bootstrap_) {
     bootstrap.stop();
   }
+}
+
+void HTTPServer::stop() {
+  stopListening();
 
   for (auto& bootstrap : bootstrap_) {
     bootstrap.join();
@@ -157,6 +195,58 @@ void HTTPServer::stop() {
   signalHandler_.reset();
   mainEventBase_->terminateLoopSoon();
   mainEventBase_ = nullptr;
+}
+
+const std::vector<const folly::AsyncSocketBase*>
+  HTTPServer::getSockets() const {
+
+  std::vector<const folly::AsyncSocketBase*> sockets;
+  FOR_EACH_RANGE(i, 0, bootstrap_.size()) {
+    auto& bootstrapSockets = bootstrap_[i].getSockets();
+    FOR_EACH_RANGE(j, 0, bootstrapSockets.size()) {
+      sockets.push_back(bootstrapSockets[j].get());
+    }
+  }
+
+  return sockets;
+}
+
+int HTTPServer::getListenSocket() const {
+  if (bootstrap_.size() == 0) {
+    return -1;
+  }
+
+  auto& bootstrapSockets = bootstrap_[0].getSockets();
+  if (bootstrapSockets.size() == 0) {
+    return -1;
+  }
+
+  auto serverSocket =
+      std::dynamic_pointer_cast<folly::AsyncServerSocket>(bootstrapSockets[0]);
+  auto socketFds = serverSocket->getSockets();
+  if (socketFds.size() == 0) {
+    return -1;
+  }
+
+  return socketFds[0];
+}
+
+void HTTPServer::updateTicketSeeds(wangle::TLSTicketKeySeeds seeds) {
+  for (auto& bootstrap : bootstrap_) {
+    bootstrap.forEachWorker([&](wangle::Acceptor* acceptor) {
+      if (!acceptor) {
+        return;
+      }
+      auto evb = acceptor->getEventBase();
+      if (!evb) {
+        return;
+      }
+      evb->runInEventBaseThread([acceptor, seeds] {
+        acceptor->setTLSTicketSecrets(
+            seeds.oldSeeds, seeds.currentSeeds, seeds.newSeeds);
+      });
+    });
+  }
 }
 
 }

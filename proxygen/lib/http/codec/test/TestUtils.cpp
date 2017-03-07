@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -51,6 +51,8 @@ makeMockParallelCodec(TransportDirection dir) {
   auto codec = folly::make_unique<testing::NiceMock<MockHTTPCodec>>();
   EXPECT_CALL(*codec, supportsParallelRequests())
     .WillRepeatedly(testing::Return(true));
+  EXPECT_CALL(*codec, getProtocol())
+    .WillRepeatedly(testing::Return(CodecProtocol::SPDY_3_1));
   EXPECT_CALL(*codec, isReusable())
     .WillRepeatedly(testing::Return(true));
   EXPECT_CALL(*codec, getTransportDirection())
@@ -83,18 +85,29 @@ std::unique_ptr<HTTPMessage> makeGetRequest() {
   return folly::make_unique<HTTPMessage>(getGetRequest());
 }
 
-HTTPMessage getPostRequest() {
+HTTPMessage getPostRequest(uint32_t contentLength) {
   HTTPMessage req;
   req.setMethod("POST");
   req.setURL<string>("/");
   req.setHTTPVersion(1, 1);
   req.getHeaders().set(HTTP_HEADER_HOST, "www.foo.com");
-  req.getHeaders().set(HTTP_HEADER_CONTENT_LENGTH, "200");
+  req.getHeaders().set(HTTP_HEADER_CONTENT_LENGTH,
+                       folly::to<string>(contentLength));
   return req;
 }
 
-std::unique_ptr<HTTPMessage> makePostRequest() {
-  return folly::make_unique<HTTPMessage>(getPostRequest());
+std::unique_ptr<HTTPMessage> makePostRequest(uint32_t contentLength) {
+  return folly::make_unique<HTTPMessage>(getPostRequest(contentLength));
+}
+
+HTTPMessage getResponse(uint32_t code, uint32_t bodyLen) {
+  HTTPMessage resp;
+  resp.setStatusCode(code);
+  if (bodyLen > 0) {
+    resp.getHeaders().set(HTTP_HEADER_CONTENT_LENGTH,
+                          folly::to<string>(bodyLen));
+  }
+  return resp;
 }
 
 std::unique_ptr<HTTPMessage> makeResponse(uint16_t statusCode) {
@@ -108,6 +121,18 @@ makeResponse(uint16_t statusCode, size_t len) {
   auto resp = makeResponse(statusCode);
   resp->getHeaders().set(HTTP_HEADER_CONTENT_LENGTH, folly::to<string>(len));
   return std::make_pair(std::move(resp), makeBuf(len));
+}
+
+HTTPMessage getUpgradeRequest(const std::string& upgradeHeader,
+                              HTTPMethod method, uint32_t bodyLen) {
+  HTTPMessage req = getGetRequest();
+  req.setMethod(method);
+  req.getHeaders().set(HTTP_HEADER_UPGRADE, upgradeHeader);
+  if (bodyLen > 0) {
+    req.getHeaders().set(HTTP_HEADER_CONTENT_LENGTH,
+                         folly::to<std::string>(bodyLen));
+  }
+  return req;
 }
 
 void fakeMockCodec(MockHTTPCodec& codec) {
@@ -171,10 +196,11 @@ void fakeMockCodec(MockHTTPCodec& codec) {
                              return 6;
                            }));
 
-  EXPECT_CALL(codec, generateGoaway(_, _, _))
+  EXPECT_CALL(codec, generateGoaway(_, _, _, _))
     .WillRepeatedly(Invoke([] (folly::IOBufQueue& writeBuf,
                                uint32_t lastStream,
-                               ErrorCode code) {
+                               ErrorCode,
+                               std::shared_ptr<folly::IOBuf>) {
                              writeBuf.append(makeBuf(6));
                              return 6;
                            }));

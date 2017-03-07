@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,10 +10,11 @@
 #pragma once
 
 #include <wangle/ssl/SSLContextConfig.h>
-#include <folly/io/async/AsyncServerSocket.h>
 #include <folly/io/async/EventBase.h>
 #include <wangle/bootstrap/ServerBootstrap.h>
 #include <proxygen/httpserver/HTTPServerOptions.h>
+#include <proxygen/lib/http/codec/HTTPCodecFactory.h>
+#include <proxygen/lib/http/session/HTTPSession.h>
 #include <thread>
 
 namespace proxygen {
@@ -38,13 +39,37 @@ class HTTPServer final {
 
   struct IPConfig {
     IPConfig(folly::SocketAddress a,
-             Protocol p)
+             Protocol p,
+             std::shared_ptr<HTTPCodecFactory> c = nullptr)
         : address(a),
-          protocol(p) {}
+          protocol(p),
+          codecFactory(c) {}
 
     folly::SocketAddress address;
     Protocol protocol;
+    std::shared_ptr<HTTPCodecFactory> codecFactory;
     std::vector<wangle::SSLContextConfig> sslConfigs;
+
+    /*
+     * Sets the initial ticket seeds to use when starting the HTTPServer.
+     * Ticket seeds are used to generate the session ticket encryption keys
+     * for ticket resumption. When using session tickets, it is important
+     * to change them and keep them updated, see updateTicketSeeds to keep
+     * seeds up to date.
+     */
+    folly::Optional<wangle::TLSTicketKeySeeds> ticketSeeds;
+
+    /*
+     * Whether to allow an insecure connection on a secure port.
+     * This should be used in very few cases where a HTTP server needs to
+     * support insecure and secure connections.
+     */
+    bool allowInsecureConnectionsOnSecureServer{false};
+    bool enableTCPFastOpen{false};
+    /**
+     * Maximum queue size of pending fast open connections.
+     */
+    uint32_t fastOpenQueueSize{10000};
   };
 
   /**
@@ -83,10 +108,21 @@ class HTTPServer final {
              std::function<void(std::exception_ptr)> onError = nullptr);
 
   /**
+   * Stop listening on bound ports. (Stop accepting new work).
+   * It does not wait for pending work to complete.
+   * You must still invoke stop() before destroying the server.
+   * You do NOT need to invoke this before calling stop().
+   * This can be called from any thread, and it is idempotent.
+   * However, it may only be called **after** start() has called onSuccess.
+   */
+  void stopListening();
+
+  /**
    * Stop HTTPServer.
    *
-   * Can be called from any thread. Server will stop listening for new
-   * connections and will wait for running requests to finish.
+   * Can be called from any thread, but only after start() has called
+   * onSuccess.  Server will stop listening for new connections and will
+   * wait for running requests to finish.
    *
    * TODO: Separate method to do hard shutdown?
    */
@@ -99,6 +135,25 @@ class HTTPServer final {
   std::vector<IPConfig> addresses() const {
     return addresses_;
   }
+
+  /**
+   * Get the sockets the server is currently bound to.
+   */
+  const std::vector<const folly::AsyncSocketBase*> getSockets() const;
+
+  void setSessionInfoCallback(HTTPSession::InfoCallback* cb) {
+    sessionInfoCb_ = cb;
+  }
+
+  /**
+   * Returns a file descriptor associated with the listening socket
+   */
+  int getListenSocket() const;
+
+  /**
+   * Updates ticket seeds for the HTTPServer for all the VIPs.
+   */
+  void updateTicketSeeds(wangle::TLSTicketKeySeeds seeds);
 
  private:
   std::shared_ptr<HTTPServerOptions> options_;
@@ -118,6 +173,11 @@ class HTTPServer final {
    */
   std::vector<IPConfig> addresses_;
   std::vector<wangle::ServerBootstrap<wangle::DefaultPipeline>> bootstrap_;
+
+  /**
+   * Callback for session create/destruction
+   */
+  HTTPSession::InfoCallback* sessionInfoCb_{nullptr};
 };
 
 }

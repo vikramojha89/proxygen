@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,7 +10,6 @@
 #pragma once
 
 #include <folly/io/IOBuf.h>
-#include <ostream>
 #include <string>
 
 namespace proxygen {

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,7 @@
  */
 #pragma once
 
-#include <gmock/gmock.h>
+#include <folly/portability/GMock.h>
 #include <proxygen/lib/http/codec/HTTPCodec.h>
 
 namespace proxygen {
@@ -72,19 +72,34 @@ class MockHTTPCodec: public HTTPCodec {
   MOCK_METHOD3(generateRstStream, size_t(folly::IOBufQueue&,
                                          HTTPCodec::StreamID,
                                          ErrorCode));
-  MOCK_METHOD3(generateGoaway, size_t(folly::IOBufQueue&,
+  MOCK_METHOD4(generateGoaway, size_t(folly::IOBufQueue&,
                                       StreamID,
-                                      ErrorCode));
+                                      ErrorCode,
+                                      std::shared_ptr<folly::IOBuf>));
+  size_t generateGoaway(folly::IOBufQueue& writeBuf,
+                        StreamID lastStream,
+                        ErrorCode statusCode,
+                        std::unique_ptr<folly::IOBuf> debugData) override {
+    return generateGoaway(writeBuf, lastStream, statusCode,
+                          std::shared_ptr<folly::IOBuf>(debugData.release()));
+  }
+
   MOCK_METHOD1(generatePingRequest, size_t(folly::IOBufQueue&));
   MOCK_METHOD2(generatePingReply, size_t(folly::IOBufQueue&,
                                          uint64_t));
   MOCK_METHOD1(generateSettings, size_t(folly::IOBufQueue&));
+  MOCK_METHOD1(generateSettingsAck, size_t(folly::IOBufQueue&));
   MOCK_METHOD3(generateWindowUpdate, size_t(folly::IOBufQueue&,
                                             StreamID,
                                             uint32_t));
   MOCK_METHOD0(getEgressSettings, HTTPSettings*());
   MOCK_CONST_METHOD0(getIngressSettings, const HTTPSettings*());
   MOCK_METHOD0(enableDoubleGoawayDrain, void());
+  MOCK_CONST_METHOD0(getDefaultWindowSize, uint32_t());
+  MOCK_METHOD3(
+    addPriorityNodes,
+    size_t(PriorityQueue&, folly::IOBufQueue&, uint8_t));
+  MOCK_CONST_METHOD1(mapPriorityToDependency, HTTPCodec::StreamID(uint8_t));
  };
 
 class MockHTTPCodecCallback: public HTTPCodec::Callback {
@@ -125,12 +140,23 @@ class MockHTTPCodecCallback: public HTTPCodec::Callback {
             newStream);
   }
   MOCK_METHOD2(onAbort, void(HTTPCodec::StreamID, ErrorCode));
-  MOCK_METHOD2(onGoaway, void(uint64_t, ErrorCode));
+  MOCK_METHOD3(onGoaway,
+               void(uint64_t, ErrorCode, std::shared_ptr<folly::IOBuf>));
+  void onGoaway(uint64_t lastGoodStreamID, ErrorCode code,
+                std::unique_ptr<folly::IOBuf> debugData) override {
+    onGoaway(lastGoodStreamID, code,
+             std::shared_ptr<folly::IOBuf>(debugData.release()));
+  }
   MOCK_METHOD1(onPingRequest, void(uint64_t));
   MOCK_METHOD1(onPingReply, void(uint64_t));
   MOCK_METHOD2(onWindowUpdate, void(HTTPCodec::StreamID, uint32_t));
   MOCK_METHOD1(onSettings, void(const SettingsList&));
   MOCK_METHOD0(onSettingsAck, void());
+  MOCK_METHOD2(onPriority, void(HTTPCodec::StreamID,
+                                const HTTPMessage::HTTPPriority&));
+  MOCK_METHOD4(onNativeProtocolUpgrade, bool(HTTPCodec::StreamID, CodecProtocol,
+                                             const std::string&,
+                                             HTTPMessage&));
   MOCK_CONST_METHOD0(numOutgoingStreams, uint32_t());
   MOCK_CONST_METHOD0(numIncomingStreams, uint32_t());
 };

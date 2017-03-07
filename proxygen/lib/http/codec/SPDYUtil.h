@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -100,8 +100,8 @@ class SPDYUtil {
               state = lws_expect_nl;
               break;
             default:
-              if (*p < 0x20 || *p == 0x7f) {
-                // unexpected ctl per rfc2616
+              if ((*p < 0x20 || *p == 0x7f) && *p != '\t') {
+                // unexpected ctl per rfc2616, HT OK
                 return false;
               }
               break;

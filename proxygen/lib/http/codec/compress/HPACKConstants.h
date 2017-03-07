@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,14 +10,13 @@
 #pragma once
 
 #include <stdint.h>
-#include <iostream>
+#include <iosfwd>
 
 namespace proxygen {
 
 namespace HPACK {
 
 const uint32_t kTableSize = 4096;
-const uint32_t kMaxLiteralSize = 96 * 1024;
 
 const uint8_t NBIT_MASKS[9] = {
   0xFF,  // 11111111, not used
@@ -32,19 +31,16 @@ const uint8_t NBIT_MASKS[9] = {
 };
 
 enum HeaderEncoding : uint8_t {
-  LITERAL_NO_INDEXING = 0x40,   // 2-bit
-  LITERAL_INCR_INDEXING = 0x00, // 2-bit
-  INDEXED = 0x80                // 1-bit
+  LITERAL_INCR_INDEXING = 0x40, // 0100 0000
+  TABLE_SIZE_UPDATE = 0x20,// 0010 0000
+  LITERAL_NEVER_INDEXING = 0x10,// 0001 0000
+  LITERAL_NO_INDEXING = 0x00,   // 0000 0000
+  INDEXED = 0x80                // 1000 0000
 };
 
 enum LiteralEncoding : uint8_t {
   PLAIN = 0x00,
   HUFFMAN = 0x80
-};
-
-enum MessageType : uint8_t {
-  REQ = 0,
-  RESP = 1
 };
 
 enum class DecodeError : uint8_t {

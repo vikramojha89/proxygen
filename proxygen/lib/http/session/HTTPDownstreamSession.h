@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,6 +10,7 @@
 #pragma once
 
 #include <proxygen/lib/http/session/HTTPSession.h>
+#include <proxygen/lib/utils/WheelTimerInstance.h>
 
 namespace proxygen {
 
@@ -25,7 +26,7 @@ class HTTPDownstreamSession final: public HTTPSession {
    *                     whatever HTTP-like wire format this session needs.
    */
   HTTPDownstreamSession(
-      folly::HHWheelTimer* transactionTimeouts,
+      const WheelTimerInstance& timeout,
       folly::AsyncTransportWrapper::UniquePtr&& sock,
       const folly::SocketAddress& localAddr,
       const folly::SocketAddress& peerAddr,
@@ -33,11 +34,28 @@ class HTTPDownstreamSession final: public HTTPSession {
       std::unique_ptr<HTTPCodec> codec,
       const wangle::TransportInfo& tinfo,
       InfoCallback* infoCallback = nullptr):
-    HTTPSession(transactionTimeouts, std::move(sock), localAddr, peerAddr,
+    HTTPSession(timeout, std::move(sock), localAddr, peerAddr,
                 CHECK_NOTNULL(controller), std::move(codec), tinfo,
                 infoCallback) {
-      CHECK(codec_->getTransportDirection() == TransportDirection::DOWNSTREAM);
+      CHECK_EQ(codec_->getTransportDirection(), TransportDirection::DOWNSTREAM);
   }
+
+  // allows using HTTPDownstreamSession with HHWheelTimer when it is not shared
+  HTTPDownstreamSession(
+      folly::HHWheelTimer* timer,
+      folly::AsyncTransportWrapper::UniquePtr&& sock,
+      const folly::SocketAddress& localAddr,
+      const folly::SocketAddress& peerAddr,
+      HTTPSessionController* controller,
+      std::unique_ptr<HTTPCodec> codec,
+      const wangle::TransportInfo& tinfo,
+      InfoCallback* infoCallback = nullptr):
+    HTTPDownstreamSession(WheelTimerInstance(timer), std::move(sock), localAddr,
+        peerAddr,CHECK_NOTNULL(controller), std::move(codec), tinfo,
+        infoCallback) {
+  }
+
+  void startNow() override;
 
  private:
   ~HTTPDownstreamSession() override;
@@ -68,6 +86,11 @@ class HTTPDownstreamSession final: public HTTPSession {
                      bool codecWasReusable) override;
 
   bool allTransactionsStarted() const override;
+
+  bool onNativeProtocolUpgrade(
+    HTTPCodec::StreamID streamID, CodecProtocol protocol,
+    const std::string& protocolString,
+    HTTPMessage& msg) override;
 };
 
 } // proxygen

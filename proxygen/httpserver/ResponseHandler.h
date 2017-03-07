@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -14,6 +14,7 @@
 namespace proxygen {
 
 class RequestHandler;
+class PushHandler;
 
 /**
  * Interface that acts as client for RequestHandler. It also has a hook
@@ -71,6 +72,9 @@ class ResponseHandler {
   virtual void pauseIngress() noexcept = 0;
 
   virtual void resumeIngress() noexcept = 0;
+
+  virtual ResponseHandler* newPushedResponse(
+    PushHandler* pushHandler) noexcept = 0;
 
   // Accessors for Transport/Connection information
   virtual const wangle::TransportInfo& getSetupTransportInfo() const noexcept = 0;

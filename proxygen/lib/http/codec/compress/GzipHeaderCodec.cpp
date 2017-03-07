@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,13 +10,13 @@
 #include <proxygen/lib/http/codec/compress/GzipHeaderCodec.h>
 
 #include <folly/Memory.h>
+#include <folly/SingletonThreadLocal.h>
 #include <folly/String.h>
 #include <folly/ThreadLocal.h>
 #include <folly/io/IOBuf.h>
 #include <proxygen/lib/http/codec/SPDYCodec.h>
 #include <proxygen/lib/http/codec/SPDYConstants.h>
 #include <proxygen/lib/utils/Logging.h>
-#include <proxygen/lib/utils/UnionBasedStatic.h>
 #include <string>
 
 using folly::IOBuf;
@@ -69,26 +69,20 @@ struct ZlibContext {
   z_stream inflater;
 };
 
-
-typedef std::map<ZlibConfig, std::unique_ptr<ZlibContext>> ZlibContextMap;
-
-DEFINE_UNION_STATIC(ThreadLocalPtr<IOBuf>, IOBuf, s_buf);
-DEFINE_UNION_STATIC(folly::ThreadLocal<ZlibContextMap>,
-                    ThreadLocalContextMap,
-                    s_zlibContexts);
-
+namespace { struct BufferTag {}; }
+static folly::SingletonThreadLocal<unique_ptr<IOBuf>, BufferTag> s_buf{};
 folly::IOBuf& getStaticHeaderBufSpace(size_t size) {
-  if (!s_buf.data) {
-    s_buf.data.reset(new IOBuf(IOBuf::CREATE, size));
+  if (!s_buf.get()) {
+    s_buf.get() = folly::make_unique<IOBuf>(IOBuf::CREATE, size);
   } else {
-    if (size > s_buf.data->capacity()) {
-      s_buf.data.reset(new IOBuf(IOBuf::CREATE, size));
+    if (size > s_buf.get()->capacity()) {
+      s_buf.get() = folly::make_unique<IOBuf>(IOBuf::CREATE, size);
     } else {
-      s_buf.data->clear();
+      s_buf.get()->clear();
     }
   }
-  DCHECK(!s_buf.data->isShared());
-  return *s_buf.data;
+  DCHECK(!s_buf.get()->isShared());
+  return *s_buf.get();
 }
 
 void appendString(uint8_t*& dst, const string& str) {
@@ -97,14 +91,17 @@ void appendString(uint8_t*& dst, const string& str) {
   dst += len;
 }
 
+using ZlibContextMap = std::map<ZlibConfig, std::unique_ptr<ZlibContext>>;
+namespace { struct ContextTag {}; }
+static folly::SingletonThreadLocal<ZlibContextMap, ContextTag> s_zlibContexts{};
 /**
  * get the thread local cached zlib context
  */
 static const ZlibContext* getZlibContext(SPDYVersionSettings versionSettings,
                                          int compressionLevel) {
   ZlibConfig zlibConfig(versionSettings.version, compressionLevel);
-  auto match = s_zlibContexts.data->find(zlibConfig);
-  if (match != s_zlibContexts.data->end()) {
+  auto match = s_zlibContexts.get().find(zlibConfig);
+  if (match != s_zlibContexts.get().end()) {
     return match->second.get();
   } else {
     // This is the first request for the specified SPDY version and compression
@@ -125,11 +122,11 @@ static const ZlibContext* getZlibContext(SPDYVersionSettings versionSettings,
                     // means raw deflate output format w/o libz header
         1,          // memory size for internal compression state, 1-9
         Z_DEFAULT_STRATEGY);
-    CHECK(r == Z_OK);
+    CHECK_EQ(r, Z_OK);
     if (compressionLevel != Z_NO_COMPRESSION) {
       r = deflateSetDictionary(&(newContext->deflater), versionSettings.dict,
                                versionSettings.dictSize);
-      CHECK(r == Z_OK);
+      CHECK_EQ(r, Z_OK);
     }
 
     newContext->inflater.zalloc = Z_NULL;
@@ -144,10 +141,10 @@ static const ZlibContext* getZlibContext(SPDYVersionSettings versionSettings,
     newContext->inflater.reserved = 0x01;
 #endif
     r = inflateInit2(&(newContext->inflater), 0);
-    CHECK(r == Z_OK);
+    CHECK_EQ(r, Z_OK);
 
     auto result = newContext.get();
-    s_zlibContexts.data->emplace(zlibConfig, std::move(newContext));
+    s_zlibContexts.get().emplace(zlibConfig, std::move(newContext));
     return result;
   }
 }
@@ -273,8 +270,8 @@ unique_ptr<IOBuf> GzipHeaderCodec::encode(vector<Header>& headers) noexcept {
   deflater_.next_out = out->writableData();
   deflater_.avail_out = maxDeflatedSize;
   int r = deflate(&deflater_, Z_SYNC_FLUSH);
-  CHECK(r == Z_OK);
-  CHECK(deflater_.avail_in == 0);
+  CHECK_EQ(r, Z_OK);
+  CHECK_EQ(deflater_.avail_in, 0);
   out->append(maxDeflatedSize - deflater_.avail_out);
 
   VLOG(4) << "header size orig=" << uncompressedLen
@@ -287,7 +284,7 @@ unique_ptr<IOBuf> GzipHeaderCodec::encode(vector<Header>& headers) noexcept {
     stats_->recordEncode(Type::GZIP, encodedSize_);
   }
 
-  return std::move(out);
+  return out;
 }
 
 Result<HeaderDecodeResult, HeaderDecodeError>
@@ -444,7 +441,7 @@ GzipHeaderCodec::parseNameValues(const folly::IOBuf& uncompressed,
       while(pos < stop) {
         if (*pos == '\0') {
           if (pos - valueStart == 0) {
-            LOG(ERROR) << "empty header value";
+            LOG(ERROR) << "empty header value for header=" << headerName;
             return HeaderDecodeError::EMPTY_HEADER_VALUE;
           }
           if (first) {
@@ -465,7 +462,7 @@ GzipHeaderCodec::parseNameValues(const folly::IOBuf& uncompressed,
       if (!first) {
         // value contained at least one \0, add the last value
         if (pos - valueStart == 0) {
-          LOG(ERROR) << "empty header value";
+          LOG(ERROR) << "empty header value for header=" << headerName;
           return HeaderDecodeError::EMPTY_HEADER_VALUE;
         }
         outHeaders_.emplace_back(headerName->str.data(),

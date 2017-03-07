@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -69,7 +69,8 @@ class PassThroughHTTPCodecFilter: public HTTPCodecFilter {
                ErrorCode code) override;
 
   void onGoaway(uint64_t lastGoodStreamID,
-                ErrorCode code) override;
+                ErrorCode code,
+                std::unique_ptr<folly::IOBuf> debugData = nullptr) override;
 
   void onPingRequest(uint64_t uniqueID) override;
 
@@ -80,6 +81,14 @@ class PassThroughHTTPCodecFilter: public HTTPCodecFilter {
   void onSettings(const SettingsList& settings) override;
 
   void onSettingsAck() override;
+
+  void onPriority(StreamID stream,
+                  const HTTPMessage::HTTPPriority& pri) override;
+
+  bool onNativeProtocolUpgrade(StreamID stream,
+                               CodecProtocol protocol,
+                               const std::string& protocolString,
+                               HTTPMessage& msg) override;
 
   uint32_t numOutgoingStreams() const override;
 
@@ -105,6 +114,8 @@ class PassThroughHTTPCodecFilter: public HTTPCodecFilter {
   size_t onIngress(const folly::IOBuf& buf) override;
 
   void onIngressEOF() override;
+
+  bool onIngressUpgradeMessage(const HTTPMessage& msg) override;
 
   bool isReusable() const override;
 
@@ -149,9 +160,11 @@ class PassThroughHTTPCodecFilter: public HTTPCodecFilter {
                            StreamID stream,
                            ErrorCode statusCode) override;
 
-  size_t generateGoaway(folly::IOBufQueue& writeBuf,
-                        StreamID lastStream,
-                        ErrorCode statusCode) override;
+  size_t generateGoaway(
+    folly::IOBufQueue& writeBuf,
+    StreamID lastStream,
+    ErrorCode statusCode,
+    std::unique_ptr<folly::IOBuf> debugData = nullptr) override;
 
   size_t generatePingRequest(folly::IOBufQueue& writeBuf) override;
 
@@ -160,9 +173,15 @@ class PassThroughHTTPCodecFilter: public HTTPCodecFilter {
 
   size_t generateSettings(folly::IOBufQueue& writeBuf) override;
 
+  size_t generateSettingsAck(folly::IOBufQueue& writeBuf) override;
+
   size_t generateWindowUpdate(folly::IOBufQueue& writeBuf,
                               StreamID stream,
                               uint32_t delta) override;
+
+  size_t generatePriority(folly::IOBufQueue& writeBuf,
+                          StreamID stream,
+                          const HTTPMessage::HTTPPriority& pri) override;
 
   HTTPSettings* getEgressSettings() override;
 
@@ -173,6 +192,17 @@ class PassThroughHTTPCodecFilter: public HTTPCodecFilter {
   void enableDoubleGoawayDrain() override;
 
   HTTPCodec::StreamID getLastIncomingStreamID() const override;
+
+  uint32_t getDefaultWindowSize() const override;
+
+  size_t addPriorityNodes(
+      PriorityQueue& queue,
+      folly::IOBufQueue& writeBuf,
+      uint8_t maxLevel) override;
+
+  StreamID mapPriorityToDependency(uint8_t priority) const override;
+
+  int8_t mapDependencyToPriority(StreamID parent) const override;
 };
 
 typedef FilterChain<

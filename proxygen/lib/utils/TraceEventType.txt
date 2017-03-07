@@ -2,6 +2,7 @@
  * Trace Event Type, please follow the pattern when you add new one.
  */
 
+TotalRequest, "TotalRequest"
 RequestExchange, "HTTPRequestExchange"
 ResponseBodyRead, "HTTPResponseBodyRead"
 PreConnect, "PreConnect"
@@ -15,6 +16,7 @@ TotalConnect, "TotalConnect"
 Decompression, "decompression_filter"
 CertVerification, "cert_verification"
 ProxyConnect, "proxy_connect"
+Push, "push"
 Scheduling, "scheduling"
 NetworkChange, "network_change"
 MultiConnector, "multi_connector"
@@ -22,6 +24,14 @@ SingleConnector, "single_connector"
 SessionTransactions, "SessionTransactions"
 TCPInfo, "TCPInfo"
 ConnInfo, "ConnInfo"
+ZeroSetup, "ZeroSetup"
+ZeroVerification, "ZeroVerification"
+ZeroConnector, "ZeroConnector"
+ReplaySafety, "ReplaySafety"
+HTTPPerfParameters, "HTTPPerfParameters"
+RetryFilter, "RetryFilter"
+ZeroFallback, "ZeroFallback"
+TLSCachedInfo, "TLSCachedInfo"
 
 /*
  * XXX: Too bad we have to define events in Liger core for the platform
@@ -30,11 +40,8 @@ ConnInfo, "ConnInfo"
 FBLigerProtocol, "FBLigerProtocol"
 
 /*
- * MQTT Client
+ * MQTT Client events
  */
 MQTTClient, "MQTTClient"
-
-/*
- * MQTT Message
- */
 MQTTMessage, "MQTTMessage"
+MQTTConnect, "MQTTConnect"

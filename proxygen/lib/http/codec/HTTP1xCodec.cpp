@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,14 +12,17 @@
 #include <folly/Memory.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
 #include <proxygen/lib/http/RFC2616.h>
+#include <proxygen/lib/http/codec/CodecProtocol.h>
 
 using folly::IOBuf;
 using folly::IOBufQueue;
+using folly::StringPiece;
 using std::string;
 using std::unique_ptr;
 
 namespace {
 
+static const std::string kChunked = "chunked";
 const char CRLF[] = "\r\n";
 
 /**
@@ -63,9 +66,9 @@ appendUint(IOBufQueue& queue, size_t& len, uint64_t value) {
   (queue).append(str, sizeof(str) - 1)
 
 void
-appendString(IOBufQueue& queue, size_t& len, const string& str) {
-  queue.append(str.data(), str.length());
-  len += str.length();
+appendString(IOBufQueue& queue, size_t& len, StringPiece str) {
+  queue.append(str.data(), str.size());
+  len += str.size();
 }
 
 const std::pair<uint8_t, uint8_t> kHTTPVersion10(1, 0);
@@ -73,8 +76,6 @@ const std::pair<uint8_t, uint8_t> kHTTPVersion10(1, 0);
 } // anonymous namespace
 
 namespace proxygen {
-
-http_parser_settings HTTP1xCodec::kParserSettings;
 
 HTTP1xCodec::HTTP1xCodec(TransportDirection direction, bool forceUpstream1_1)
   : callback_(nullptr),
@@ -105,6 +106,7 @@ HTTP1xCodec::HTTP1xCodec(TransportDirection direction, bool forceUpstream1_1)
     ingressUpgrade_(false),
     ingressUpgradeComplete_(false),
     egressUpgrade_(false),
+    nativeUpgrade_(false),
     headersComplete_(false) {
   switch (direction) {
   case TransportDirection::DOWNSTREAM:
@@ -150,6 +152,24 @@ HTTP1xCodec::setParserPaused(bool paused) {
   parserPaused_ = paused;
 }
 
+const http_parser_settings* HTTP1xCodec::getParserSettings() {
+  static http_parser_settings parserSettings = [] {
+    http_parser_settings st;
+    st.on_message_begin = HTTP1xCodec::onMessageBeginCB;
+    st.on_url = HTTP1xCodec::onUrlCB;
+    st.on_header_field = HTTP1xCodec::onHeaderFieldCB;
+    st.on_header_value = HTTP1xCodec::onHeaderValueCB;
+    st.on_headers_complete = HTTP1xCodec::onHeadersCompleteCB;
+    st.on_body = HTTP1xCodec::onBodyCB;
+    st.on_message_complete = HTTP1xCodec::onMessageCompleteCB;
+    st.on_reason = HTTP1xCodec::onReasonCB;
+    st.on_chunk_header = HTTP1xCodec::onChunkHeaderCB;
+    st.on_chunk_complete = HTTP1xCodec::onChunkCompleteCB;
+    return st;
+  }();
+  return &parserSettings;
+}
+
 size_t
 HTTP1xCodec::onIngress(const IOBuf& buf) {
   if (parserError_) {
@@ -163,7 +183,7 @@ HTTP1xCodec::onIngress(const IOBuf& buf) {
     parserActive_ = true;
     currentIngressBuf_ = &buf;
     size_t bytesParsed = http_parser_execute(&parser_,
-                                             &kParserSettings,
+                                             getParserSettings(),
                                              (const char*)buf.data(),
                                              buf.length());
     // in case we parsed a section of the headers but we're not done parsing
@@ -207,7 +227,7 @@ HTTP1xCodec::onIngressEOF() {
     return;
   }
   parserActive_ = true;
-  if (http_parser_execute(&parser_, &kParserSettings, nullptr, 0) != 0) {
+  if (http_parser_execute(&parser_, getParserSettings(), nullptr, 0) != 0) {
     parserError_ = true;
   } else {
     parserError_ = (HTTP_PARSER_ERRNO(&parser_) != HPE_OK) &&
@@ -234,7 +254,7 @@ HTTP1xCodec::onParserError(const char* what) {
   }
   // store the ingress buffer
   if (currentIngressBuf_) {
-    error.setCurrentIngressBuf(std::move(currentIngressBuf_->clone()));
+    error.setCurrentIngressBuf(currentIngressBuf_->clone());
   }
   if (transportDirection_ == TransportDirection::DOWNSTREAM &&
       egressTxnID_ < ingressTxnID_) {
@@ -259,7 +279,7 @@ HTTP1xCodec::onParserError(const char* what) {
 
 bool
 HTTP1xCodec::isReusable() const {
-  return keepalive_ && !egressUpgrade_ && !ingressUpgrade_;
+  return keepalive_ && !egressUpgrade_ && !ingressUpgrade_ && !parserError_;
 }
 
 bool
@@ -281,7 +301,7 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
                             StreamID assocStream,
                             bool eom,
                             HTTPHeaderSize* size) {
-  CHECK(assocStream == 0) << "HTTP does not support pushed transactions, "
+  CHECK_EQ(assocStream, 0) << "HTTP does not support pushed transactions, "
     "assocStream=" << assocStream;
   if (keepalive_ && disableKeepalivePending_) {
     keepalive_ = false;
@@ -289,7 +309,7 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
   const bool upstream = (transportDirection_ == TransportDirection::UPSTREAM);
   const bool downstream = !upstream;
   if (upstream) {
-    DCHECK(txn == egressTxnID_);
+    DCHECK_EQ(txn, egressTxnID_);
     requestPending_ = true;
     responsePending_ = true;
     connectRequest_ = (msg.getMethod() == HTTPMethod::CONNECT);
@@ -372,6 +392,10 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
     appendLiteral(writeBuf, len, ".");
     appendUint(writeBuf, len, version.second);
     mayChunkEgress_ = (version.first == 1) && (version.second >= 1);
+    if (!upgradeHeader_.empty()) {
+      LOG(DFATAL) << "Attempted to pipeline HTTP request with pending upgrade";
+      upgradeHeader_.clear();
+    }
     break;
   }
   if (keepalive_ &&
@@ -389,8 +413,9 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
   appendLiteral(writeBuf, len, CRLF);
   const string* deferredContentLength = nullptr;
   bool hasTransferEncodingChunked = false;
-  bool hasUpgradeHeader = false;
   bool hasDateHeader = false;
+  std::vector<StringPiece> connectionTokens;
+  size_t lastConnectionToken = 0;
   msg.getHeaders().forEachWithCode([&] (HTTPHeaderCode code,
                                         const string& header,
                                         const string& value) {
@@ -398,18 +423,28 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
       // Write the Content-Length last (t1071703)
       deferredContentLength = &value;
       return; // continue
-    } else if (code == HTTP_HEADER_CONNECTION) {
-      // TODO: add support for the case where "close" is part of
-      // a comma-separated list of values
+    } else if (code == HTTP_HEADER_CONNECTION && !is1xxResponse_) {
       static const string kClose = "close";
-      if (caseInsensitiveEqual(value, kClose)) {
-        keepalive_ = false;
+      static const string kKeepAlive = "keep-alive";
+      folly::split(',', value, connectionTokens);
+      for (auto curConnectionToken = lastConnectionToken;
+           curConnectionToken < connectionTokens.size();
+           curConnectionToken++) {
+        auto token = trimWhitespace(connectionTokens[curConnectionToken]);
+        if (caseInsensitiveEqual(token, kClose)) {
+          keepalive_ = false;
+        } else if (!caseInsensitiveEqual(token, kKeepAlive)) {
+          connectionTokens[lastConnectionToken++] = token;
+        } // else eat the keep-alive token
       }
+      connectionTokens.resize(lastConnectionToken);
       // We'll generate a new Connection header based on the keepalive_ state
       return;
+    } else if (code == HTTP_HEADER_UPGRADE && upstream && txn == 1) {
+      // save in case we get a 101 Switching Protocols
+      upgradeHeader_ = value;
     } else if (!hasTransferEncodingChunked &&
                code == HTTP_HEADER_TRANSFER_ENCODING) {
-      static const string kChunked = "chunked";
       if (!caseInsensitiveEqual(value, kChunked)) {
         return;
       }
@@ -417,8 +452,6 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
       if (!mayChunkEgress_) {
         return;
       }
-    } else if (code == HTTP_HEADER_UPGRADE) {
-      hasUpgradeHeader = true;
     } else if (!hasDateHeader && code == HTTP_HEADER_DATE) {
       hasDateHeader = true;
     }
@@ -434,7 +467,7 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
     dst += value.length();
     *dst++ = '\r';
     *dst = '\n';
-    DCHECK(size_t(++dst - (char*)writable.first) == lineLen);
+    DCHECK_EQ(size_t(++dst - (char*)writable.first), lineLen);
     writeBuf.postallocate(lineLen);
     len += lineLen;
   });
@@ -462,12 +495,13 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
   if (downstream && !hasDateHeader) {
     addDateHeader(writeBuf, len);
   }
-  if (!is1xxResponse_ || upstream || hasUpgradeHeader) {
+  if (!is1xxResponse_ || upstream || !connectionTokens.empty()) {
     appendLiteral(writeBuf, len, "Connection: ");
-    if (hasUpgradeHeader) {
-      // Upgrade header needs to have 'upgrade' keyword as the connection type
-      appendLiteral(writeBuf, len, "upgrade\r\n");
-    } else if (keepalive_) {
+    for (auto token: connectionTokens) {
+      appendString(writeBuf, len, token);
+      appendLiteral(writeBuf, len, ", ");
+    }
+    if (keepalive_) {
       appendLiteral(writeBuf, len, "keep-alive\r\n");
     } else {
       appendLiteral(writeBuf, len, "close\r\n");
@@ -476,7 +510,7 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
   if (deferredContentLength) {
     appendLiteral(writeBuf, len, "Content-Length: ");
     appendString(writeBuf, len, *deferredContentLength);
-    appendString(writeBuf, len, CRLF);
+    appendLiteral(writeBuf, len, CRLF);
   }
   appendLiteral(writeBuf, len, CRLF);
   if (eom) {
@@ -495,7 +529,7 @@ HTTP1xCodec::generateBody(IOBufQueue& writeBuf,
                           unique_ptr<IOBuf> chain,
                           boost::optional<uint8_t> padding,
                           bool eom) {
-  DCHECK(txn == egressTxnID_);
+  DCHECK_EQ(txn, egressTxnID_);
   if (!chain) {
     return 0;
   }
@@ -511,8 +545,8 @@ HTTP1xCodec::generateBody(IOBufQueue& writeBuf,
   if (egressChunked_ && !inChunk_) {
     char chunkLenBuf[32];
     int rc = snprintf(chunkLenBuf, sizeof(chunkLenBuf), "%zx\r\n", buflen);
-    CHECK(rc > 0);
-    CHECK(size_t(rc) < sizeof(chunkLenBuf));
+    CHECK_GT(rc, 0);
+    CHECK_LT(size_t(rc), sizeof(chunkLenBuf));
 
     writeBuf.append(chunkLenBuf, rc);
     totLen += rc;
@@ -544,8 +578,8 @@ size_t HTTP1xCodec::generateChunkHeader(IOBufQueue& writeBuf,
     inChunk_ = true;
     char chunkLenBuf[32];
     int rc = snprintf(chunkLenBuf, sizeof(chunkLenBuf), "%zx\r\n", length);
-    CHECK(rc > 0);
-    CHECK(size_t(rc) < sizeof(chunkLenBuf));
+    CHECK_GT(rc, 0);
+    CHECK_LT(size_t(rc), sizeof(chunkLenBuf));
 
     writeBuf.append(chunkLenBuf, rc);
     return rc;
@@ -569,7 +603,7 @@ size_t
 HTTP1xCodec::generateTrailers(IOBufQueue& writeBuf,
                               StreamID txn,
                               const HTTPHeaders& trailers) {
-  DCHECK(txn == egressTxnID_);
+  DCHECK_EQ(txn, egressTxnID_);
   size_t len = 0;
   if (egressChunked_) {
     CHECK(!inChunk_);
@@ -586,7 +620,7 @@ HTTP1xCodec::generateTrailers(IOBufQueue& writeBuf,
 }
 
 size_t HTTP1xCodec::generateEOM(IOBufQueue& writeBuf, StreamID txn) {
-  DCHECK(txn == egressTxnID_);
+  DCHECK_EQ(txn, egressTxnID_);
   size_t len = 0;
   if (egressChunked_) {
     CHECK(!inChunk_);
@@ -624,13 +658,25 @@ size_t HTTP1xCodec::generateRstStream(IOBufQueue& writeBuf,
   return 0;
 }
 
-size_t HTTP1xCodec::generateGoaway(IOBufQueue& writeBuf,
-                                   StreamID lastStream,
-                                   ErrorCode statusCode) {
+size_t HTTP1xCodec::generateGoaway(
+  IOBufQueue&,
+  StreamID,
+  ErrorCode,
+  std::unique_ptr<folly::IOBuf>) {
   // statusCode ignored for HTTP/1.1
   // We won't be able to send anything else on the transport after this.
   disableKeepalivePending_ = true;
   return 0;
+}
+
+void HTTP1xCodec::setAllowedUpgradeProtocols(std::list<std::string> protocols) {
+  CHECK(transportDirection_ == TransportDirection::DOWNSTREAM);
+  for (const auto& proto: protocols) {
+    allowedNativeUpgrades_ += folly::to<string>(proto, ",");
+  }
+  if (!allowedNativeUpgrades_.empty()) {
+    allowedNativeUpgrades_.erase(allowedNativeUpgrades_.size() - 1);
+  }
 }
 
 int
@@ -649,7 +695,9 @@ HTTP1xCodec::onMessageBegin() {
       !is1xxResponse_) {
     ++ingressTxnID_;
   }
-  is1xxResponse_ = false;
+  if (transportDirection_ == TransportDirection::UPSTREAM) {
+    is1xxResponse_ = false;
+  }
   callback_->onMessageBegin(ingressTxnID_, msg_.get());
   return 0;
 }
@@ -746,6 +794,36 @@ HTTP1xCodec::onHeadersComplete(size_t len) {
     pushHeaderNameAndValue(msg_->getHeaders());
   }
 
+  // discard messages with folded or multiple valued Transfer-Encoding headers
+  // ex : "chunked , zorg\r\n" or "\r\n chunked \r\n" (t12767790)
+  HTTPHeaders& hdrs = msg_->getHeaders();
+  const std::string& headerVal =
+    hdrs.getSingleOrEmpty(HTTP_HEADER_TRANSFER_ENCODING);
+  if (!headerVal.empty() && !caseInsensitiveEqual(headerVal, kChunked)) {
+      LOG(ERROR) << "Invalid Transfer-Encoding header. Value =" << headerVal;
+      return -1;
+  }
+
+  // discard messages with multiple content-length headers (t12767790)
+  if (hdrs.getNumberOfValues("Content-Length") > 1) {
+    // Only reject the message if the Content-Length headers have different
+    // values
+    folly::Optional<folly::StringPiece> contentLen;
+    bool error = hdrs.forEachValueOfHeader(
+        "Content-Length", [&] (folly::StringPiece value) -> bool {
+      if (!contentLen.hasValue()) {
+        contentLen = value;
+        return false;
+      }
+      return (contentLen.value() != value);
+    });
+
+    if (error) {
+      LOG(ERROR) << "Invalid message, multiple Content-Length headers";
+      return -1;
+    }
+  }
+
   // Update the HTTPMessage with the values parsed from the header
   msg_->setHTTPVersion(parser_.http_major, parser_.http_minor);
   msg_->setIsChunked((parser_.flags & F_CHUNKED));
@@ -781,6 +859,14 @@ HTTP1xCodec::onHeadersComplete(size_t len) {
     reason_.clear();
   }
 
+  folly::ScopeGuard g = folly::makeGuard([this] {
+      // Always clear the outbound upgrade header after we receive a response
+      if (transportDirection_ == TransportDirection::UPSTREAM &&
+          parser_.status_code != 100) {
+        upgradeHeader_.clear();
+      }
+    });
+  headerParseState_ = HeaderParseState::kParsingHeadersComplete;
   if (transportDirection_ == TransportDirection::UPSTREAM) {
     if (connectRequest_ &&
         (parser_.status_code >= 200 && parser_.status_code < 300)) {
@@ -789,8 +875,38 @@ HTTP1xCodec::onHeadersComplete(size_t len) {
       ingressUpgrade_ = true;
     } else if (parser_.status_code == 101) {
       // Set the upgrade flags if the server has upgraded.
-      ingressUpgrade_ = true;
-      egressUpgrade_ = true;
+      const std::string& serverUpgrade =
+        msg_->getHeaders().getSingleOrEmpty(HTTP_HEADER_UPGRADE);
+      if (serverUpgrade.empty() ||
+          upgradeHeader_.empty()) {
+        LOG(ERROR) << "Invalid 101 response, empty upgrade headers";
+        return -1;
+      }
+      auto result = checkForProtocolUpgrade(upgradeHeader_,
+                                            serverUpgrade,
+                                            false /* client mode */);
+      if (result) {
+        ingressUpgrade_ = true;
+        egressUpgrade_ = true;
+        if (result->first != CodecProtocol::HTTP_1_1) {
+          bool success = callback_->onNativeProtocolUpgrade(
+            ingressTxnID_, result->first, result->second, *msg_);
+          if (success) {
+            nativeUpgrade_ = true;
+            msg_->setIsUpgraded(ingressUpgrade_);
+            return 1;  // no message body if successful
+          }
+        } else if (result->second == getCodecProtocolString(result->first)) {
+          // someone upgraded to http/1.1?  Reset upgrade flags
+          ingressUpgrade_ = false;
+          egressUpgrade_ = false;
+        }
+        // else, there's some non-native upgrade
+      } else {
+        LOG(ERROR) << "Invalid 101 response, client/server upgrade mismatch "
+          "client=" << upgradeHeader_ << " server=" << serverUpgrade;
+        return -1;
+      }
     }
   }
   else {
@@ -801,11 +917,23 @@ HTTP1xCodec::onHeadersComplete(size_t len) {
       // we will start forwarding data to the proxy without waiting for
       // the response from the proxy server.
       ingressUpgrade_ = true;
+    } else if (!allowedNativeUpgrades_.empty() && ingressTxnID_ == 1) {
+      upgradeHeader_ = msg_->getHeaders().getSingleOrEmpty(HTTP_HEADER_UPGRADE);
+      if (!upgradeHeader_.empty() && !allowedNativeUpgrades_.empty()) {
+        auto result = checkForProtocolUpgrade(upgradeHeader_,
+                                              allowedNativeUpgrades_,
+                                              true /* server mode */);
+        if (result && result->first != CodecProtocol::HTTP_1_1) {
+          upgradeResult_ = *result;
+          // unfortunately have to copy because msg_ is passed to
+          // onHeadersComplete
+          upgradeRequest_ = folly::make_unique<HTTPMessage>(*msg_);
+        }
+      }
     }
   }
   msg_->setIsUpgraded(ingressUpgrade_);
 
-  headerParseState_ = HeaderParseState::kParsingHeadersComplete;
   bool msgKeepalive = msg_->computeKeepalive();
   if (!msgKeepalive) {
      keepalive_ = false;
@@ -853,7 +981,7 @@ int
 HTTP1xCodec::onBody(const char* buf, size_t len) {
   DCHECK(!isParsingHeaders());
   DCHECK(!inRecvLastChunk_);
-  CHECK(currentIngressBuf_ != nullptr);
+  CHECK_NOTNULL(currentIngressBuf_);
   const char* dataStart = (const char*)currentIngressBuf_->data();
   const char* dataEnd = dataStart + currentIngressBuf_->length();
   DCHECK_GE(buf, dataStart);
@@ -902,13 +1030,27 @@ int HTTP1xCodec::onMessageComplete() {
 
   switch (transportDirection_) {
   case TransportDirection::DOWNSTREAM:
+  {
     requestPending_ = false;
+    if (upgradeRequest_) {
+      ingressUpgrade_ = callback_->onNativeProtocolUpgrade(
+        ingressTxnID_, upgradeResult_.first, upgradeResult_.second,
+        *upgradeRequest_);
+      upgradeRequest_.reset();
+    }
+    // else there was no match, OR we upgraded to http/1.1 OR someone specified
+    // a non-native protocol in the setAllowedUpgradeProtocols.  No-ops
     break;
+  }
   case TransportDirection::UPSTREAM:
     responsePending_ = is1xxResponse_;
   }
 
-  callback_->onMessageComplete(ingressTxnID_, ingressUpgrade_);
+  if (!nativeUpgrade_) {
+    callback_->onMessageComplete(ingressTxnID_, ingressUpgrade_);
+  }
+  // else we suppressed onHeadersComplete, suppress onMessageComplete also.
+  // The new codec will handle these callbacks with the real message
 
   if (ingressUpgrade_) {
     ingressUpgradeComplete_ = true;
@@ -1063,20 +1205,6 @@ HTTP1xCodec::onMessageCompleteCB(http_parser* parser) {
     codec->onParserError(ex.what());
     return 1;
   }
-}
-
-void
-HTTP1xCodec::initParserSettings() {
-  kParserSettings.on_message_begin = HTTP1xCodec::onMessageBeginCB;
-  kParserSettings.on_url = HTTP1xCodec::onUrlCB;
-  kParserSettings.on_header_field = HTTP1xCodec::onHeaderFieldCB;
-  kParserSettings.on_header_value = HTTP1xCodec::onHeaderValueCB;
-  kParserSettings.on_headers_complete = HTTP1xCodec::onHeadersCompleteCB;
-  kParserSettings.on_body = HTTP1xCodec::onBodyCB;
-  kParserSettings.on_message_complete = HTTP1xCodec::onMessageCompleteCB;
-  kParserSettings.on_reason = HTTP1xCodec::onReasonCB;
-  kParserSettings.on_chunk_header = HTTP1xCodec::onChunkHeaderCB;
-  kParserSettings.on_chunk_complete = HTTP1xCodec::onChunkCompleteCB;
 }
 
 bool HTTP1xCodec::supportsNextProtocol(const std::string& npn) {

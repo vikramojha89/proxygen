@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,6 +10,7 @@
 #pragma once
 
 #include <folly/Memory.h>
+#include <folly/Function.h>
 #include <glog/logging.h>
 #include <memory>
 #include <utility>
@@ -294,7 +295,7 @@ class FilterChain: private FilterType {
    * Adds filters with the given types to the front of the chain.
    */
   template<typename C, typename C2, typename... Types>
-  std::enable_if<std::is_constructible<C>::value> addFilters() {
+  typename std::enable_if<std::is_constructible<C>::value>::type addFilters() {
     // Callback <-> F1 <-> F2 ... <-> F_new <-> Destination
     this->append(new C());
     addFilters<C2, Types...>();
@@ -304,7 +305,7 @@ class FilterChain: private FilterType {
    * Base case of above function where we add a single filter.
    */
   template<typename C>
-  std::enable_if<std::is_constructible<C>::value> addFilters() {
+  typename std::enable_if<std::is_constructible<C>::value>::type addFilters() {
     this->append(new C());
   }
 
@@ -341,6 +342,15 @@ class FilterChain: private FilterType {
 
   const T1* operator->() const { return call(); }
   T1* operator->() { return call(); }
+
+  void foreach(folly::FunctionRef<void(FilterChainType*)> fn) {
+    auto cur = this->next_;
+    while (cur) {
+      auto filter = cur;
+      cur = cur->next_;
+      fn(filter);
+    }
+  }
 
  private:
   /**

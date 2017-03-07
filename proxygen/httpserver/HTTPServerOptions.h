@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include <folly/io/async/AsyncServerSocket.h>
 #include <folly/SocketAddress.h>
 #include <proxygen/httpserver/Filters.h>
 #include <proxygen/httpserver/RequestHandlerFactory.h>
@@ -68,6 +69,11 @@ class HTTPServerOptions {
   uint32_t listenBacklog{1024};
 
   /**
+   * Enable cleartext upgrades to HTTP/2
+   */
+  bool h2cEnabled{false};
+
+  /**
    * Signals on which to shutdown the server. Mostly you will want
    * {SIGINT, SIGTERM}. Note, if you have multiple deamons running or you want
    * to have a separate signal handler, leave this empty and handle signals
@@ -80,6 +86,13 @@ class HTTPServerOptions {
    * don't want that.
    */
   bool supportsConnect{false};
+
+  /**
+   * Flow control configuration for the acceptor
+   */
+  size_t initialReceiveWindow{65536};
+  size_t receiveStreamWindowSize{65536};
+  size_t receiveSessionWindowSize{65536};
 
   /**
    * Set to true to enable gzip content compression. Currently false for
@@ -114,5 +127,31 @@ class HTTPServerOptions {
     "text/plain",
     "text/xml",
   };
+
+  /**
+   * This holds sockets already bound to addresses that the server
+   * will listen on and will be empty once the server starts.
+   */
+  std::vector<folly::AsyncServerSocket::UniquePtr> preboundSockets_;
+
+  /**
+   * Bind to existing file descriptor(s).
+   * AsyncServerSocket can handle multiple fds and they can be provided
+   * as a vector here.
+   */
+  void useExistingSocket(folly::AsyncServerSocket::UniquePtr socket) {
+    preboundSockets_.push_back(std::move(socket));
+  }
+
+  void useExistingSocket(int socketFd) {
+    useExistingSockets({socketFd});
+  }
+
+  void useExistingSockets(const std::vector<int>& socketFds) {
+    folly::AsyncServerSocket::UniquePtr socket(new folly::AsyncServerSocket);
+
+    socket->useExistingSockets(socketFds);
+    useExistingSocket(std::move(socket));
+  }
 };
 }

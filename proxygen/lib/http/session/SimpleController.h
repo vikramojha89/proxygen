@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -53,6 +53,8 @@ class SimpleController : public HTTPSessionController {
 
   void attachSession(HTTPSession*) override;
   void detachSession(const HTTPSession*) override;
+
+  std::chrono::milliseconds getGracefulShutdownTimeout() const override;
  protected:
   HTTPTransactionHandler* createErrorHandler(
       uint32_t statusCode,

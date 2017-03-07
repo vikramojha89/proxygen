@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -75,9 +75,11 @@ void PassThroughHTTPCodecFilter::onAbort(StreamID stream,
   callback_->onAbort(stream, code);
 }
 
-void PassThroughHTTPCodecFilter::onGoaway(uint64_t lastGoodStreamID,
-                                          ErrorCode code) {
-  callback_->onGoaway(lastGoodStreamID, code);
+void PassThroughHTTPCodecFilter::onGoaway(
+  uint64_t lastGoodStreamID,
+  ErrorCode code,
+  std::unique_ptr<folly::IOBuf> debugData) {
+  callback_->onGoaway(lastGoodStreamID, code, std::move(debugData));
 }
 
 void PassThroughHTTPCodecFilter::onPingRequest(uint64_t uniqueID) {
@@ -99,6 +101,19 @@ void PassThroughHTTPCodecFilter::onSettings(const SettingsList& settings) {
 
 void PassThroughHTTPCodecFilter::onSettingsAck() {
   callback_->onSettingsAck();
+}
+
+void PassThroughHTTPCodecFilter::onPriority(
+  StreamID stream,
+  const HTTPMessage::HTTPPriority& pri) {
+  callback_->onPriority(stream, pri);
+}
+
+bool PassThroughHTTPCodecFilter::onNativeProtocolUpgrade(
+  StreamID streamID, CodecProtocol protocol, const std::string& protocolString,
+  HTTPMessage& msg) {
+  return callback_->onNativeProtocolUpgrade(streamID, protocol, protocolString,
+                                            msg);
 }
 
 uint32_t PassThroughHTTPCodecFilter::numOutgoingStreams() const {
@@ -148,6 +163,11 @@ size_t PassThroughHTTPCodecFilter::onIngress(const folly::IOBuf& buf) {
 
 void PassThroughHTTPCodecFilter::onIngressEOF() {
   call_->onIngressEOF();
+}
+
+bool PassThroughHTTPCodecFilter::onIngressUpgradeMessage(
+  const HTTPMessage& msg) {
+  return call_->onIngressUpgradeMessage(msg);
 }
 
 bool PassThroughHTTPCodecFilter::isReusable() const {
@@ -230,8 +250,10 @@ size_t PassThroughHTTPCodecFilter::generateRstStream(
 size_t PassThroughHTTPCodecFilter::generateGoaway(
     folly::IOBufQueue& writeBuf,
     StreamID lastStream,
-    ErrorCode statusCode) {
-  return call_->generateGoaway(writeBuf, lastStream, statusCode);
+    ErrorCode statusCode,
+    std::unique_ptr<folly::IOBuf> debugData) {
+  return call_->generateGoaway(writeBuf, lastStream, statusCode,
+                               std::move(debugData));
 }
 
 size_t PassThroughHTTPCodecFilter::generatePingRequest(
@@ -249,12 +271,24 @@ size_t PassThroughHTTPCodecFilter::generateSettings(folly::IOBufQueue& buf) {
   return call_->generateSettings(buf);
 }
 
+size_t PassThroughHTTPCodecFilter::generateSettingsAck(folly::IOBufQueue& buf) {
+  return call_->generateSettingsAck(buf);
+}
+
 size_t PassThroughHTTPCodecFilter::generateWindowUpdate(
   folly::IOBufQueue& buf,
   StreamID stream,
   uint32_t delta) {
   return call_->generateWindowUpdate(buf, stream, delta);
 }
+
+size_t PassThroughHTTPCodecFilter::generatePriority(
+  folly::IOBufQueue& writeBuf,
+  StreamID stream,
+  const HTTPMessage::HTTPPriority& pri) {
+  return call_->generatePriority(writeBuf, stream, pri);
+}
+
 
 HTTPSettings* PassThroughHTTPCodecFilter::getEgressSettings() {
   return call_->getEgressSettings();
@@ -276,6 +310,28 @@ void PassThroughHTTPCodecFilter::setHeaderCodecStats(
 HTTPCodec::StreamID
 PassThroughHTTPCodecFilter::getLastIncomingStreamID() const {
   return call_->getLastIncomingStreamID();
+}
+
+uint32_t PassThroughHTTPCodecFilter::getDefaultWindowSize() const {
+  return call_->getDefaultWindowSize();
+}
+
+size_t
+PassThroughHTTPCodecFilter::addPriorityNodes(
+    PriorityQueue& queue,
+    folly::IOBufQueue& writeBuf,
+    uint8_t maxLevel) {
+  return call_->addPriorityNodes(queue, writeBuf, maxLevel);
+}
+
+HTTPCodec::StreamID
+PassThroughHTTPCodecFilter::mapPriorityToDependency(uint8_t priority) const {
+  return call_->mapPriorityToDependency(priority);
+}
+
+int8_t
+PassThroughHTTPCodecFilter::mapDependencyToPriority(StreamID parent) const {
+  return call_->mapDependencyToPriority(parent);
 }
 
 }

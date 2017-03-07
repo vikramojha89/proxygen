@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,6 +8,8 @@
  *
  */
 #include "ChromeUtils.h"
+
+#include <folly/portability/GFlags.h>
 
 #include <string>
 
@@ -22,6 +24,11 @@ int8_t getChromeVersion(folly::StringPiece agent) {
     auto startNum = found + search.length();
     if (agent.size() > startNum + 3) {
       num = (agent[startNum] - '0') * 10 + (agent[startNum + 1] - '0');
+    }
+    // Edge claims to be Chrome
+    found = agent.find("Edge/");
+    if (found != std::string::npos) {
+      return -1;
     }
   }
   return num;

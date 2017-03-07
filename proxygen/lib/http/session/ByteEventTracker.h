@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -13,7 +13,6 @@
 #include <proxygen/lib/http/session/ByteEvents.h>
 #include <proxygen/lib/http/session/HTTPTransaction.h>
 #include <proxygen/lib/utils/Time.h>
-#include <folly/io/async/AsyncSocket.h>
 
 namespace proxygen {
 
@@ -33,7 +32,8 @@ class ByteEventTracker {
 
   virtual ~ByteEventTracker();
   explicit ByteEventTracker(Callback* callback): callback_(callback) {}
-  explicit ByteEventTracker(ByteEventTracker&&) noexcept;
+
+  void absorb(ByteEventTracker&& other);
   void setCallback(Callback* callback) { callback_ = callback; }
 
   void addPingByteEvent(size_t pingSize,
@@ -44,7 +44,8 @@ class ByteEventTracker {
   void addFirstHeaderByteEvent(uint64_t offset, HTTPTransaction* txn);
 
   virtual size_t drainByteEvents();
-  virtual void processByteEvents(uint64_t bytesWritten,
+  virtual bool processByteEvents(std::shared_ptr<ByteEventTracker> self,
+                                 uint64_t bytesWritten,
                                  bool eorTrackingEnabled);
   virtual void addLastByteEvent(HTTPTransaction* txn,
                                 uint64_t byteNo,
@@ -55,19 +56,20 @@ class ByteEventTracker {
    */
   virtual uint64_t preSend(bool* cork, bool* eom, uint64_t bytesWritten);
 
-  virtual void addAckToLastByteEvent(HTTPTransaction* txn,
-                                     const ByteEvent& lastByteEvent,
-                                     bool eorTrackingEnabled) {}
+  virtual void addAckToLastByteEvent(
+      HTTPTransaction* /* txn */,
+      const ByteEvent& /* lastByteEvent */,
+      bool /* eorTrackingEnabled */) {}
 
   virtual void deleteAckEvent(
-    std::vector<AckByteEvent*>::iterator& it) noexcept {}
+    std::vector<AckByteEvent*>::iterator& /* it */) noexcept {}
 
   virtual bool setMaxTcpAckTracked(
-    uint32_t maxAckTracked,
-    AsyncTimeoutSet* ackLatencyTimeouts,
-    folly::AsyncTransportWrapper* transport) { return false; }
+    uint32_t /* maxAckTracked */,
+    AsyncTimeoutSet* /* ackLatencyTimeouts */,
+    folly::AsyncTransportWrapper* /* transport */) { return false; }
 
-  virtual void setTTLBAStats(TTLBAStats* stats) {}
+  virtual void setTTLBAStats(TTLBAStats* /* stats */) {}
 
   virtual void onAckLatencyEvent(const AckLatencyEvent&) {}
 

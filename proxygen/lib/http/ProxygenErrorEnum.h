@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -51,6 +51,15 @@ namespace proxygen {
     x(ClientSilent),                            \
     x(Canceled),                                \
     x(ParseResponse),                           \
+    x(ConnRefused),                             \
+    x(DNSOtherServer),                          \
+    x(DNSOtherClient),                          \
+    x(DNSOtherCancelled),                       \
+    x(DNSshutdown),                             \
+    x(DNSgetaddrinfo),                          \
+    x(DNSthreadpool),                           \
+    x(DNSunimplemented),                        \
+    x(Network),                                 \
     x(Max)
 
 // Increase this if you add more error types and Max exceeds 63

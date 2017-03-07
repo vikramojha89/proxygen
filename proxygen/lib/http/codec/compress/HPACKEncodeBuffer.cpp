@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,6 @@
  */
 #include <proxygen/lib/http/codec/compress/HPACKEncodeBuffer.h>
 
-#include <ctype.h>
 #include <memory>
 #include <proxygen/lib/http/codec/compress/HPACKConstants.h>
 #include <proxygen/lib/http/codec/compress/Logging.h>
@@ -35,7 +34,7 @@ HPACKEncodeBuffer::HPACKEncodeBuffer(
 HPACKEncodeBuffer::HPACKEncodeBuffer(uint32_t growthSize) :
     growthSize_(growthSize),
     buf_(&bufQueue_, growthSize),
-    huffmanTree_(huffman::reqHuffTree05()),
+    huffmanTree_(huffman::huffTree()),
     huffmanEnabled_(false) {
 }
 

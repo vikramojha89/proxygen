@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -7,12 +7,10 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 #include <memory>
 #include <proxygen/lib/http/codec/compress/HeaderTable.h>
 #include <proxygen/lib/http/codec/compress/Logging.h>
-#include <proxygen/lib/http/codec/compress/StaticHeaderTable.h>
 #include <sstream>
 
 using namespace std;
@@ -144,6 +142,29 @@ TEST_F(HeaderTableTests, print) {
   out << t;
   EXPECT_EQ(out.str(),
   "\n[1] (s=51) Accept-Encoding: gzip\nreference set: [1, ]\ntotal size: 51\n");
+}
+
+TEST_F(HeaderTableTests, increaseCapacity) {
+  HPACKHeader accept("accept-encoding", "gzip");
+  uint32_t max = 4;
+  uint32_t capacity = accept.bytes() * max;
+  HeaderTable table(capacity);
+  EXPECT_GT(table.length(), max);
+
+  // fill the table
+  for (size_t i = 0; i < table.length() + 1; i++) {
+    EXPECT_EQ(table.add(accept), true);
+  }
+  EXPECT_EQ(table.size(), max);
+  EXPECT_EQ(table.getIndex(accept), 4);
+  // head should be 0, tail should be 2
+  max = 8;
+  table.setCapacity(accept.bytes() * max);
+
+  EXPECT_GT(table.length(), max);
+  // external index didn't change
+  EXPECT_EQ(table.getIndex(accept), 4);
+
 }
 
 }

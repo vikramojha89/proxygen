@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -87,7 +87,8 @@ class HTTPCodecPrinter: public PassThroughHTTPCodecFilter {
    * Called from SPDYCodec::onGoaway() with different arguments
    *             HTTP2Codec::parseGoaway()
    */
-  void onGoaway(uint64_t lastGoodStreamID, ErrorCode code) override;
+  void onGoaway(uint64_t lastGoodStreamID, ErrorCode code,
+                std::unique_ptr<folly::IOBuf> debugData = nullptr) override;
 
   /*
    * Called from SPDYCodec::onPing()

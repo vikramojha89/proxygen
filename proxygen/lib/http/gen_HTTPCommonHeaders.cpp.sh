@@ -1,5 +1,18 @@
 #!/bin/bash
 
+if [ "x$1" != "x" ];then
+	export HEADERS_LIST="$1"
+fi
+if [ "x$2" != "x" ];then
+	export FBCODE_DIR="$2"
+fi
+if [ "x$3" != "x" ];then
+	export INSTALL_DIR="$3"
+fi
+if [ "x$4" != "x" ];then
+	export GPERF="$4"
+fi
+
 # Some fun stuff going on here.
 #
 # 1) The `cat` here isn't useless, despite what it may seem. Also, the
@@ -21,7 +34,7 @@
 # (and less hairy honestly) than the massive `sed` pipeline which used to be
 # here. And it really isn't that bad, this is the sort of thing `awk` was
 # designed for.
-cat ${HEADERS_LIST?} | sort | uniq \
+cat ${HEADERS_LIST?} | LC_ALL=C sort | uniq \
 | awk '
   NR == FNR {
     n[FNR] = $1;
@@ -42,3 +55,6 @@ cat ${HEADERS_LIST?} | sort | uniq \
   }
 ' - "${FBCODE_DIR?}/proxygen/lib/http/HTTPCommonHeaders.template.gperf" \
 | ${GPERF:-gperf} -m5 --output-file="${INSTALL_DIR?}/HTTPCommonHeaders.cpp"
+if [[ "$(readlink -f test 2>/dev/null)" ]]; then
+    sed -i  "s:$(readlink -f ${FBCODE_DIR?})/::g" "${INSTALL_DIR?}/HTTPCommonHeaders.cpp"
+fi

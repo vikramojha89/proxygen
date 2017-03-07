@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,9 +8,11 @@
  *
  */
 #include <proxygen/lib/http/session/HTTPUpstreamSession.h>
+#include <proxygen/lib/http/session/HTTPSessionController.h>
 
 #include <wangle/acceptor/ConnectionManager.h>
 #include <proxygen/lib/http/session/HTTPTransaction.h>
+#include <proxygen/lib/http/codec/HTTPCodecFactory.h>
 
 namespace proxygen {
 
@@ -60,11 +62,22 @@ bool HTTPUpstreamSession::isClosing() const {
     resetAfterDrainingWrites_;
 }
 
-HTTPTransaction*
-HTTPUpstreamSession::newTransaction(HTTPTransaction::Handler* handler,
-                                    int8_t priority) {
-  CHECK_NOTNULL(handler);
+void HTTPUpstreamSession::startNow() {
+  // startNow in base class CHECKs this session has not started.
+  HTTPSession::startNow();
+  // Upstream specific:
+  // create virtual priority nodes and send Priority frames to peer if necessary
+  auto bytes = codec_->addPriorityNodes(
+      txnEgressQueue_,
+      writeBuf_,
+      maxVirtualPriorityLevel_);
+  if (bytes) {
+    scheduleWrite();
+  }
+}
 
+HTTPTransaction*
+HTTPUpstreamSession::newTransaction(HTTPTransaction::Handler* handler) {
   if (!supportsMoreTransactions() || draining_) {
     // This session doesn't support any more parallel transactions
     return nullptr;
@@ -74,14 +87,12 @@ HTTPUpstreamSession::newTransaction(HTTPTransaction::Handler* handler,
     startNow();
   }
 
-  auto txn = createTransaction(codec_->createStream(),
-                               0,
-                               priority);
+  auto txn = createTransaction(codec_->createStream(), 0);
 
   if (txn) {
     DestructorGuard dg(this);
     auto txnID = txn->getID();
-    txn->setHandler(handler);
+    txn->setHandler(CHECK_NOTNULL(handler));
     setNewTransactionPauseState(txnID);
   }
   return txn;
@@ -108,5 +119,80 @@ bool HTTPUpstreamSession::allTransactionsStarted() const {
   }
   return true;
 }
+
+bool HTTPUpstreamSession::onNativeProtocolUpgrade(
+  HTTPCodec::StreamID streamID, CodecProtocol protocol,
+  const std::string& protocolString,
+  HTTPMessage&) {
+
+  VLOG(4) << *this << " onNativeProtocolUpgrade streamID=" << streamID <<
+    " protocol=" << protocolString;
+
+  // Create the new Codec
+  auto codec = HTTPCodecFactory::getCodec(protocol,
+                                          TransportDirection::UPSTREAM);
+  bool ret = onNativeProtocolUpgradeImpl(streamID, std::move(codec),
+                                         protocolString);
+  if (ret) {
+    auto bytes = codec_->addPriorityNodes(
+      txnEgressQueue_,
+      writeBuf_,
+      maxVirtualPriorityLevel_);
+    if (bytes) {
+      scheduleWrite();
+    }
+  }
+  return ret;
+}
+
+void
+HTTPUpstreamSession::attachThreadLocals(
+  folly::EventBase* eventBase,
+  folly::SSLContextPtr sslContext,
+  const WheelTimerInstance& timeout,
+  HTTPSessionStats* stats, FilterIteratorFn fn,
+  HeaderCodec::Stats* headerCodecStats,
+  HTTPUpstreamSessionController* controller) {
+  txnEgressQueue_.attachThreadLocals(timeout);
+  timeout_ = timeout;
+  setController(controller);
+  setSessionStats(stats);
+  if (sock_) {
+    sock_->attachEventBase(eventBase);
+    auto sslSocket = sock_->getUnderlyingTransport<folly::AsyncSSLSocket>();
+    if (sslSocket) {
+      sslSocket->attachSSLContext(sslContext);
+    }
+  }
+  codec_.foreach(fn);
+  codec_->setHeaderCodecStats(headerCodecStats);
+  resumeReadsImpl();
+  rescheduleLoopCallbacks();
+}
+
+void
+HTTPUpstreamSession::detachThreadLocals() {
+  CHECK(transactions_.empty());
+  cancelLoopCallbacks();
+  pauseReadsImpl();
+  if (sock_) {
+    auto sslSocket = sock_->getUnderlyingTransport<folly::AsyncSSLSocket>();
+    if (sslSocket) {
+      sslSocket->detachSSLContext();
+    }
+    sock_->detachEventBase();
+  }
+  txnEgressQueue_.detachThreadLocals();
+  setController(nullptr);
+  setSessionStats(nullptr);
+  // The codec filters *shouldn't* be accessible while the socket is detached,
+  // I hope
+  codec_->setHeaderCodecStats(nullptr);
+  auto cm = getConnectionManager();
+  if (cm) {
+    cm->removeConnection(this);
+  }
+}
+
 
 } // proxygen

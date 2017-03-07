@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -38,6 +38,11 @@ struct AcceptorConfiguration : public wangle::ServerSocketConfig {
   bool internal{false};
 
   /**
+  * Determines if connection should respect HTTP2 priorities
+  **/
+  bool HTTP2PrioritiesEnabled{true};
+
+  /**
    * The number of milliseconds a transaction can be idle before we close it.
    */
   std::chrono::milliseconds transactionIdleTimeout{600000};
@@ -54,14 +59,37 @@ struct AcceptorConfiguration : public wangle::ServerSocketConfig {
   std::string plaintextProtocol;
 
   /**
+   * Comma separated string of protocols that can be upgraded to from HTTP/1.1
+   */
+  std::list<std::string> allowedPlaintextUpgradeProtocols;
+
+  /**
    * The maximum number of transactions the remote could initiate
    * per connection on protocols that allow multiplexing.
    */
   uint32_t maxConcurrentIncomingStreams{0};
 
+  /**
+   * Flow control parameters.
+   *
+   *  initialReceiveWindow     = amount to advertise to peer via SETTINGS
+   *  receiveStreamWindowSize  = amount to increase per-stream window via
+   *                             WINDOW_UPDATE
+   *  receiveSessionWindowSize = amount to increase per-session window via
+   *                             WINDOW_UPDATE
+   *                             This also controls the size of the per-session
+   *                             read buffer.
+   */
   size_t initialReceiveWindow{65536};
   size_t receiveStreamWindowSize{65536};
   size_t receiveSessionWindowSize{65536};
+
+  /**
+   * These parameters control how many bytes HTTPSession's will buffer in user
+   * space before applying backpressure to handlers.  -1 means use the
+   * built-in HTTPSession default (64kb)
+   */
+  int64_t writeBufferLimit{-1};
 };
 
 } // proxygen

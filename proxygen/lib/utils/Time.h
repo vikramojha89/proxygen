@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,6 +12,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <string>
+
+#include <folly/portability/Time.h>
+
+#include <openssl/ossl_typ.h>
 
 namespace proxygen {
 
@@ -109,6 +114,27 @@ inline void getDateTimeStr(char datebuf[32], char timebuf[32]) {
     strftime(timebuf, sizeof(char) * 32, "%H:%M:%S", &now_tm);
   }
 }
+
+/**
+ * Get the current date + offset days in %Y-%m-%d format.
+ */
+inline void getDateOffsetStr(char datebuf[32], int dayOffset) {
+  time_t t = toTimeT(getCurrentTime<SteadyClock>());
+  t += dayOffset * 24 * 60 * 60;
+  struct tm final_tm;
+  localtime_r(&t, &final_tm);
+  strftime(datebuf, sizeof(char) * 32, "%Y-%m-%d", &final_tm);
+}
+
+/**
+ * Helper method to convert to OpenSSL type ASN1_TIME to a printable date and
+ * time string.
+ *
+ * @param time    a pointer to the ASN1_TIME instance to be converted.
+ * @return        a human readable date and time string for the openssl type
+ *                ASN1_TIME. If there is any error, returns empty string.
+ */
+std::string getDateTimeStr(const ASN1_TIME* const time);
 
 /**
  * Class used to get steady time. We use a separate class to mock it easier.

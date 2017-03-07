@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include <folly/Portability.h>
 #include <folly/io/IOBufQueue.h>
 #include <proxygen/lib/http/HTTPException.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
@@ -52,6 +53,13 @@ class HTTPCodec {
 
   static const StreamID MAX_STREAM_ID = 1 << 31;
 
+  class PriorityQueue {
+   public:
+    virtual ~PriorityQueue() {}
+
+    virtual void addPriorityNode(StreamID id, StreamID parent) = 0;
+  };
+
   /**
    * Callback interface that users of HTTPCodec must implement
    */
@@ -72,9 +80,9 @@ class HTTPCodec {
      *                 which can never be 0
      * @param msg      A newly allocated HTTPMessage
      */
-    virtual void onPushMessageBegin(StreamID stream,
-                                    StreamID assocStream,
-                                    HTTPMessage* msg) {}
+    virtual void onPushMessageBegin(StreamID /* stream */,
+                                    StreamID /* assocStream */,
+                                    HTTPMessage* /* msg */) {}
 
     /**
      * Called when all the headers of an ingress message have been parsed
@@ -112,7 +120,7 @@ class HTTPCodec {
      * @param stream    The stream ID
      * @param length    The chunk length.
      */
-    virtual void onChunkHeader(StreamID stream, size_t length) {}
+    virtual void onChunkHeader(StreamID /* stream */, size_t /* length */) {}
 
     /**
      * Called when the terminating CRLF is received to end a chunk of HTTP body
@@ -120,7 +128,7 @@ class HTTPCodec {
      *
      * @param stream    The stream ID
      */
-    virtual void onChunkComplete(StreamID stream) {}
+    virtual void onChunkComplete(StreamID /* stream */) {}
 
     /**
      * Called when all the trailers of an ingress message have been
@@ -156,8 +164,9 @@ class HTTPCodec {
      * @param code     The code the stream was aborted with
      * @note  Not applicable to all protocols.
      */
-    virtual void onAbort(StreamID stream,
-                         ErrorCode code) {}
+    virtual void onAbort(
+        StreamID /* stream */,
+        ErrorCode /* code */) {}
 
     /**
      * Called upon receipt of a frame header.
@@ -167,39 +176,43 @@ class HTTPCodec {
      * @param version   The version of frame (SPDY only)
      * @note Not all protocols have frames. SPDY does, but HTTP/1.1 doesn't.
      */
-    virtual void onFrameHeader(uint32_t stream_id,
-                               uint8_t flags,
-                               uint32_t length,
-                               uint16_t version = 0) {}
+    virtual void onFrameHeader(
+        uint32_t /* stream_id */,
+        uint8_t /* flags */,
+        uint32_t /* length */,
+        uint16_t /* version */ = 0) {}
 
     /**
      * Called upon receipt of a goaway.
      * @param lastGoodStreamID  Last successful stream created by the receiver
      * @param code              The code the connection was aborted with
+     * @param debugData         The additional debug data for diagnostic purpose
      * @note Not all protocols have goaways. SPDY does, but HTTP/1.1 doesn't.
      */
-    virtual void onGoaway(uint64_t lastGoodStreamID,
-                          ErrorCode code) {}
+    virtual void onGoaway(
+        uint64_t /* lastGoodStreamID */,
+        ErrorCode /* code */,
+        std::unique_ptr<folly::IOBuf> /* debugData */ = nullptr) {}
 
     /**
      * Called upon receipt of a ping request
      * @param uniqueID  Unique identifier for the ping
      * @note Not all protocols have pings.  SPDY does, but HTTP/1.1 doesn't.
      */
-    virtual void onPingRequest(uint64_t uniqueID) {}
+    virtual void onPingRequest(uint64_t /* uniqueID */) {}
 
     /**
      * Called upon receipt of a ping reply
      * @param uniqueID  Unique identifier for the ping
      * @note Not all protocols have pings.  SPDY does, but HTTP/1.1 doesn't.
      */
-    virtual void onPingReply(uint64_t uniqueID) {}
+    virtual void onPingReply(uint64_t /* uniqueID */) {}
 
     /**
      * Called upon receipt of a window update, for protocols that support
      * flow control. For instance spdy/3 and higher.
      */
-    virtual void onWindowUpdate(StreamID stream, uint32_t amount) {}
+    virtual void onWindowUpdate(StreamID /* stream */, uint32_t /* amount */) {}
 
     /**
      * Called upon receipt of a settings frame, for protocols that support
@@ -207,13 +220,33 @@ class HTTPCodec {
      *
      * @param settings a list of settings that were sent in the settings frame
      */
-    virtual void onSettings(const SettingsList& settings) {}
+    virtual void onSettings(const SettingsList& /* settings */) {}
 
     /**
      * Called upon receipt of a settings frame with ACK set, for
      * protocols that support settings ack.
      */
     virtual void onSettingsAck() {}
+
+    /**
+     * Called upon receipt of a priority frame, for protocols that support
+     * dynamic priority
+     */
+    virtual void onPriority(
+        StreamID /* stream */,
+        const HTTPMessage::HTTPPriority& /* pri */) {}
+
+    /**
+     * Called upon receipt of a valid protocol switch.  Return false if
+     * protocol switch could not be completed.
+     */
+    virtual bool onNativeProtocolUpgrade(
+        StreamID /* stream */,
+        CodecProtocol /* protocol */,
+        const std::string& /* protocolString */,
+        HTTPMessage& /* msg */) {
+      return false;
+    }
 
     /**
      * Return the number of open streams started by this codec callback.
@@ -298,6 +331,14 @@ class HTTPCodec {
   virtual void onIngressEOF() = 0;
 
   /**
+   * Invoked on a codec that has been upgraded to via an HTTPMessage on
+   * a different codec.  The codec may return false to halt the upgrade.
+   */
+  virtual bool onIngressUpgradeMessage(const HTTPMessage& /* msg */) {
+    return true;
+  }
+
+  /**
    * Check whether the codec can process new streams. Typically,
    * an implementing subclass will return true when a new codec is
    * created and false once it encounters a situation that would
@@ -342,7 +383,7 @@ class HTTPCodec {
    *
    * @return size of the generated message
    */
-  virtual size_t generateConnectionPreface(folly::IOBufQueue& writeBuf) {
+  virtual size_t generateConnectionPreface(folly::IOBufQueue& /* writeBuf */) {
     return 0;
   }
 
@@ -420,28 +461,33 @@ class HTTPCodec {
    * Generate any protocol framing needed to abort a stream.
    * @return number of bytes written
    */
-  virtual size_t generateGoaway(folly::IOBufQueue& writeBuf,
-                                StreamID lastStream,
-                                ErrorCode code) = 0;
+  virtual size_t generateGoaway(
+    folly::IOBufQueue& writeBuf,
+    StreamID lastStream,
+    ErrorCode code,
+    std::unique_ptr<folly::IOBuf> debugData = nullptr) = 0;
 
   /**
    * If the protocol supports it, generate a ping message that the other
    * side should respond to.
    */
-  virtual size_t generatePingRequest(folly::IOBufQueue& writeBuf) { return 0; }
+  virtual size_t generatePingRequest(folly::IOBufQueue& /* writeBuf */) {
+    return 0;
+  }
 
   /**
    * Generate a reply to a ping message, if supported in the
    * protocol implemented by the codec.
    */
-  virtual size_t generatePingReply(folly::IOBufQueue& writeBuf,
-                                   uint64_t uniqueID) { return 0; }
+  virtual size_t generatePingReply(
+      folly::IOBufQueue& /* writeBuf */,
+      uint64_t /* uniqueID */) { return 0; }
 
   /**
    * Generate a settings message, if supported in the
    * protocol implemented by the codec.
    */
-  virtual size_t generateSettings(folly::IOBufQueue& writeBuf) {
+  virtual size_t generateSettings(folly::IOBufQueue& /* writeBuf */) {
     return 0;
   }
 
@@ -449,7 +495,7 @@ class HTTPCodec {
    * Generate a settings ack message, if supported in the
    * protocol implemented by the codec.
    */
-  virtual size_t generateSettingsAck(folly::IOBufQueue& writeBuf) {
+  virtual size_t generateSettingsAck(folly::IOBufQueue& /* writeBuf */) {
     return 0;
   }
 
@@ -459,12 +505,22 @@ class HTTPCodec {
    * Returns the number of bytes written on the wire as a result of invoking
    * this function.
    */
-  virtual size_t generateWindowUpdate(folly::IOBufQueue& writeBuf,
-                                      StreamID stream,
-                                      uint32_t delta) {
+  virtual size_t generateWindowUpdate(
+      folly::IOBufQueue& /* writeBuf */,
+      StreamID /* stream */,
+      uint32_t /* delta */) {
     return 0;
   }
 
+  /*
+   * Generate a PRIORITY message, if supported
+   */
+  virtual size_t generatePriority(
+      folly::IOBufQueue& /* writeBuf */,
+      StreamID /* stream */,
+      const HTTPMessage::HTTPPriority& /* pri */) {
+    return 0;
+  }
   /*
    * The below interfaces need only be implemented if the codec supports
    * settings
@@ -478,21 +534,60 @@ class HTTPCodec {
   }
 
   /**
-   * This interface is only implemented by SPDYCodec. This enables some
-   * HTTP/2 style behavior during graceful shutdown that allows 2 GOAWAYs
-   * to be sent during shutdown.
+   * This enables HTTP/2 style behavior during graceful shutdown that allows
+   * 2 GOAWAYs to be sent during shutdown.
    */
   virtual void enableDoubleGoawayDrain() {}
 
   /**
    * set stats for the header codec, if the protocol supports header compression
    */
-  virtual void setHeaderCodecStats(HeaderCodec::Stats* stats) {}
+  virtual void setHeaderCodecStats(HeaderCodec::Stats* /* stats */) {}
 
   /**
    * Get the identifier of the last stream started by the remote.
    */
   virtual StreamID getLastIncomingStreamID() const { return NoStream; }
+
+  /**
+   * Get the default size of flow control windows for this protocol
+   */
+  virtual uint32_t getDefaultWindowSize() const { return 0; }
+
+  /**
+   * Create virtual nodes in HTTP/2 priority tree. Some protocols (SPDY) have a
+   * linear priority structure which must be simulated in the HTTP/2 tree
+   * structure with "virtual" nodes representing different priority bands.
+   * There are other cases we simply want a "plain" linear priority structure
+   * even with HTTP/2. In that case a Priority frame will also be sent out for
+   * each virtual node created so that peer will have the same linear structure.
+   *
+   * @param queue     the priority queue to add nodes
+   * @param writeBuf  IOBufQueue to append priority frames to send. For SPDY,
+   *                    the writeBuf will be ignored.
+   * @param maxLavel  the max level of virtual priority nodes to create. For
+   *                    SPDY, this value will be ignored.
+   */
+  virtual size_t addPriorityNodes(
+      PriorityQueue& /* queue */,
+      folly::IOBufQueue& /* writeBuf */,
+      uint8_t /* maxLevel */) {
+    return 0;
+  }
+
+  /**
+   * Map the given linear priority to the correct parent node dependency
+   */
+  virtual StreamID mapPriorityToDependency(uint8_t /* priority */) const {
+    return 0;
+  }
+
+  /**
+   * Map the parent back to the priority, -1 if this doesn't make sense.
+   */
+  virtual int8_t mapDependencyToPriority(StreamID /* parent */) const {
+    return -1;
+  }
 };
 
 }

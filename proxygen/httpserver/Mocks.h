@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,7 @@
  */
 #pragma once
 
-#include <gmock/gmock.h>
+#include <folly/portability/GMock.h>
 #include <proxygen/httpserver/RequestHandler.h>
 #include <proxygen/httpserver/ResponseHandler.h>
 
@@ -37,6 +37,8 @@ class MockResponseHandler : public ResponseHandler {
   GMOCK_METHOD0_(, noexcept, , refreshTimeout, void());
   GMOCK_METHOD0_(, noexcept, , pauseIngress, void());
   GMOCK_METHOD0_(, noexcept, , resumeIngress, void());
+  GMOCK_METHOD1_(, noexcept, , newPushedResponse,
+                 ResponseHandler*(PushHandler*));
 
   MOCK_CONST_METHOD1(getCurrentTransportInfo, void(wangle::TransportInfo*));
 #ifdef __clang__

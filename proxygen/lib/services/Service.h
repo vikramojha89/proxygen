@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -69,6 +69,15 @@ class Service {
   virtual void stopAccepting() = 0;
 
   /**
+   * Forcibly stop "pct" (0.0 to 1.0) of the remaining client connections.
+   *
+   * If the service does not stop on its own after stopAccepting() is called,
+   * then proxygen might call dropConnections() several times to gradually
+   * stop all processing before finally calling forceStop().
+   */
+  virtual void dropConnections(double pct) {}
+
+  /**
    * Forcibly stop the service.
    *
    * If the service does not stop on its own after stopAccepting() is called,
@@ -81,6 +90,14 @@ class Service {
    * forceStop() isn't strictly required.)
    */
   virtual void forceStop() {}
+
+  /**
+   * Perform per-thread init.
+   *
+   * This method will be called once for each RequestWorker thread, just after
+   * the worker thread started.
+   */
+  virtual void initWorkerState(RequestWorker*) {}
 
   /**
    * Perform per-thread cleanup.

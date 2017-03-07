@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,12 +9,11 @@
  */
 #include <proxygen/lib/http/HTTPMessage.h>
 
-#include <array>
 #include <boost/algorithm/string.hpp>
 #include <folly/Format.h>
 #include <folly/Range.h>
+#include <folly/SingletonThreadLocal.h>
 #include <string>
-#include <utility>
 #include <vector>
 
 using folly::IOBuf;
@@ -94,6 +93,8 @@ HTTPMessage::HTTPMessage(const HTTPMessage& message) :
     sslVersion_(message.sslVersion_),
     sslCipher_(message.sslCipher_),
     protoStr_(message.protoStr_),
+    pri_(message.pri_),
+    h2Pri_(message.h2Pri_),
     parsedCookies_(message.parsedCookies_),
     parsedQueryParams_(message.parsedQueryParams_),
     chunked_(message.chunked_),
@@ -126,6 +127,8 @@ HTTPMessage& HTTPMessage::operator=(const HTTPMessage& message) {
   sslVersion_ = message.sslVersion_;
   sslCipher_ = message.sslCipher_;
   protoStr_ = message.protoStr_;
+  pri_ = message.pri_;
+  h2Pri_ = message.h2Pri_;
   parsedCookies_ = message.parsedCookies_;
   parsedQueryParams_ = message.parsedQueryParams_;
   chunked_ = message.chunked_;
@@ -224,16 +227,34 @@ bool HTTPMessage::isHTTP1_1() const {
   return version_ == kHTTPVersion11;
 }
 
+namespace {
+struct FormattedDate {
+  time_t lastTime{0};
+  string date;
+
+  string formatDate() {
+    const auto now = std::chrono::system_clock::to_time_t(
+      std::chrono::system_clock::now());
+
+    if (now != lastTime) {
+      char buff[1024];
+      tm timeTupple;
+      gmtime_r(&now, &timeTupple);
+
+      strftime(buff, 1024, "%a, %d %b %Y %H:%M:%S %Z", &timeTupple);
+      date = std::string(buff);
+      lastTime = now;
+    }
+    return date;
+  }
+};
+}
+
 string HTTPMessage::formatDateHeader() {
-  const auto now = std::chrono::system_clock::to_time_t(
-    std::chrono::system_clock::now());
+  struct DateTag {};
+  static folly::SingletonThreadLocal<FormattedDate, DateTag> s_formattedDate{};
 
-  char buff[1024];
-  tm timeTupple;
-  gmtime_r(&now, &timeTupple);
-
-  strftime(buff, 1024, "%a, %d %b %Y %H:%M:%S %Z", &timeTupple);
-  return std::string(buff);
+  return s_formattedDate.get().formatDate();
 }
 
 void HTTPMessage::ensureHostHeader() {
@@ -711,6 +732,12 @@ bool HTTPMessage::checkForHeaderToken(const HTTPHeaderCode headerCode,
                                       char const* token,
                                       bool caseSensitive) const {
   StringPiece tokenPiece(token);
+  string lowerToken;
+  if (!caseSensitive) {
+    lowerToken = token;
+    boost::to_lower(lowerToken, defaultLocale);
+    tokenPiece.reset(lowerToken);
+  }
   // Search through all of the headers with this name.
   // forEachValueOfHeader will return true iff it was "broken" prematurely
   // with "return true" in the lambda-function

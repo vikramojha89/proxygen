@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,6 +12,8 @@
 #include <proxygen/lib/http/HTTPMessageFilters.h>
 
 namespace proxygen {
+
+static const std::string kMockFilterName = "MockFilter";
 
 class MockHTTPMessageFilter : public HTTPMessageFilter {
  public:
@@ -40,6 +42,16 @@ class MockHTTPMessageFilter : public HTTPMessageFilter {
     std::unique_ptr<HTTPMessage> msgU(new HTTPMessage(*msg));
     nextOnHeadersComplete(std::move(msgU));
   }
+
+  const std::string& getFilterName() noexcept override {
+    return kMockFilterName;
+  }
+
+  [[noreturn]] virtual std::unique_ptr<HTTPMessageFilter> clone()
+  noexcept override {
+    LOG(FATAL) << "clone() not implemented for filter: "
+               << this->getFilterName();
+  };
 
   void nextOnEOMPublic() {
     nextOnEOM();

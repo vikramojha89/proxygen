@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -27,6 +27,7 @@ class RequestWorker : public WorkerThread {
   class FinishCallback {
    public:
     virtual ~FinishCallback() noexcept {}
+    virtual void workerStarted(RequestWorker*) = 0;
     virtual void workerFinished(RequestWorker*) = 0;
   };
 
@@ -73,6 +74,7 @@ class RequestWorker : public WorkerThread {
   void flushStats();
 
  private:
+  void setup() override;
   void cleanup() override;
 
   // The next request id within this thread. The id has its highest byte set to

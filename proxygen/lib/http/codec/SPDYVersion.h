@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -11,6 +11,6 @@
 
 namespace proxygen {
 
-enum class SPDYVersion { SPDY2 = 0, SPDY3, SPDY3_1, SPDY3_1_HPACK };
+enum class SPDYVersion { SPDY3 = 0, SPDY3_1 };
 
 }

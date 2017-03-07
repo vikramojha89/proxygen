@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -31,7 +31,7 @@ class ScopedHandler : public RequestHandler {
     requestBody_.append(std::move(body));
   }
 
-  void onUpgrade(proxygen::UpgradeProtocol proto) noexcept override {}
+  void onUpgrade(proxygen::UpgradeProtocol) noexcept override {}
 
   void onEOM() noexcept override {
     try {
@@ -53,7 +53,7 @@ class ScopedHandler : public RequestHandler {
 
   void requestComplete() noexcept override { delete this; }
 
-  void onError(ProxygenError err) noexcept override { delete this; }
+  void onError(ProxygenError) noexcept override { delete this; }
  private:
   HandlerType* const handlerPtr_{nullptr};
 
@@ -67,7 +67,7 @@ class ScopedHandlerFactory : public RequestHandlerFactory {
   explicit ScopedHandlerFactory(HandlerType handler): handler_(handler) {
   }
 
-  void onServerStart() noexcept override {
+  void onServerStart(folly::EventBase*) noexcept override {
   }
 
   void onServerStop() noexcept override {
@@ -160,7 +160,7 @@ ScopedHTTPServer::start<std::unique_ptr<RequestHandlerFactory>>(
   };
 
   if (sslCfg) {
-    cfg.sslConfigs.push_back(*sslCfg.release());
+    cfg.sslConfigs.push_back(*sslCfg);
   }
 
   std::vector<HTTPServer::IPConfig> IPs = { cfg };

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,6 @@
  */
 #include <proxygen/lib/utils/AsyncTimeoutSet.h>
 
-#include <cassert>
 #include <folly/ScopeGuard.h>
 #include <folly/io/async/Request.h>
 

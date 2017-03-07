@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -7,21 +7,14 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
-#include <arpa/inet.h>
 #include <fcntl.h>
-#include <gtest/gtest.h>
-#include <libgen.h>
-#include <list>
-#include <netdb.h>
-#include <netinet/in.h>
+#include <folly/portability/GTest.h>
 #include <proxygen/lib/http/HTTPMessage.h>
 #include <proxygen/lib/utils/TestUtils.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/types.h>
-#include <unistd.h>
 
 using namespace proxygen;
 using namespace std;
@@ -458,4 +451,15 @@ TEST(HTTPMessage, SetQueryParamTests) {
                     "b",
                     "localhost:80/foo?param2=b#qqq",
                     "param2=b");
+}
+
+TEST(HTTPMessage, TestCheckForHeaderToken) {
+  HTTPMessage msg;
+  HTTPHeaders& headers = msg.getHeaders();
+
+  headers.add(HTTP_HEADER_CONNECTION, "HTTP2-Settings");
+  EXPECT_TRUE(msg.checkForHeaderToken(HTTP_HEADER_CONNECTION, "HTTP2-Settings",
+                                      false));
+  EXPECT_FALSE(msg.checkForHeaderToken(HTTP_HEADER_CONNECTION, "http2-settings",
+                                       true));
 }

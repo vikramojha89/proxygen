@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -87,7 +87,8 @@ class TestAsyncTransport : public folly::AsyncTransportWrapper,
   void addReadEvent(folly::IOBufQueue& chain,
                     std::chrono::milliseconds delayFromPrevious);
   void addReadEvent(const char* buf,
-                    std::chrono::milliseconds delayFromPrevious);
+                    std::chrono::milliseconds delayFromPrevious=
+                    std::chrono::milliseconds(0));
   void addReadEOF(std::chrono::milliseconds delayFromPrevious);
   void addReadError(const folly::AsyncSocketException& ex,
                     std::chrono::milliseconds delayFromPrevious);

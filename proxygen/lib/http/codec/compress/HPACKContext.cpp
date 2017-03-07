@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -15,38 +15,36 @@ using std::string;
 
 namespace proxygen {
 
-HPACKContext::HPACKContext(HPACK::MessageType msgType, uint32_t tableSize) :
-    table_(tableSize), msgType_(msgType) {
+HPACKContext::HPACKContext(uint32_t tableSize) :
+    table_(tableSize) {
 }
 
 uint32_t HPACKContext::getIndex(const HPACKHeader& header) const {
-  uint32_t index = table_.getIndex(header);
-  if (index) {
-    return dynamicToGlobalIndex(index);
-  }
-  index = getStaticTable().getIndex(header);
+  uint32_t index = getStaticTable().getIndex(header);
   if (index) {
     return staticToGlobalIndex(index);
+  }
+  index = table_.getIndex(header);
+  if (index) {
+    return dynamicToGlobalIndex(index);
   }
   return 0;
 }
 
 uint32_t HPACKContext::nameIndex(const string& name) const {
-  uint32_t index = table_.nameIndex(name);
-  if (index) {
-    return dynamicToGlobalIndex(index);
-  }
-  index = getStaticTable().nameIndex(name);
+  uint32_t index = getStaticTable().nameIndex(name);
   if (index) {
     return staticToGlobalIndex(index);
+  }
+  index = table_.nameIndex(name);
+  if (index) {
+    return dynamicToGlobalIndex(index);
   }
   return 0;
 }
 
 bool HPACKContext::isStatic(uint32_t index) const {
-  return
-    index > table_.size()
-    && index <= table_.size() + getStaticTable().size();
+  return index <= getStaticTable().size();
 }
 
 const HPACKHeader& HPACKContext::getStaticHeader(uint32_t index) {
@@ -64,6 +62,22 @@ const HPACKHeader& HPACKContext::getHeader(uint32_t index) {
     return getStaticHeader(index);
   }
   return getDynamicHeader(index);
+}
+
+void HPACKContext::seedHeaderTable(
+  std::vector<HPACKHeader>& headers) {
+  for (const auto& header: headers) {
+    table_.add(header);
+  }
+}
+
+void HPACKContext::describe(std::ostream& os) const {
+  os << table_;
+}
+
+std::ostream& operator<<(std::ostream& os, const HPACKContext& context) {
+  context.describe(os);
+  return os;
 }
 
 }

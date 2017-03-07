@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,6 +9,8 @@
  */
 #include <proxygen/lib/http/codec/HTTPCodecPrinter.h>
 
+#include <iostream>
+
 namespace proxygen {
 
 void HTTPCodecPrinter::onFrameHeader(
@@ -17,10 +19,8 @@ void HTTPCodecPrinter::onFrameHeader(
     uint32_t length,
     uint16_t version) {
   switch (call_->getProtocol()) {
-    case CodecProtocol::SPDY_2:
     case CodecProtocol::SPDY_3:
     case CodecProtocol::SPDY_3_1:
-    case CodecProtocol::SPDY_3_1_HPACK:
       if (version > 0) {
         // Print frame header info of SPDY control frames
         std::cout << "[CTRL FRAME] version=" << version << ", flags="
@@ -71,6 +71,11 @@ void HTTPCodecPrinter::onHeadersComplete(
     std::unique_ptr<HTTPMessage> msg) {
   std::cout << "HEADERS: stream_id=" << stream
             << ", numHeaders=" << msg->getHeaders().size() << std::endl;
+  if (msg->isRequest()) {
+    std::cout << "URL=" << msg->getURL() << std::endl;
+  } else {
+    std::cout << "Status=" << msg->getStatusCode() << std::endl;
+  }
   msg->getHeaders().forEach([&] (
         const std::string& header,
         const std::string& val) {
@@ -85,10 +90,13 @@ void HTTPCodecPrinter::onAbort(StreamID stream, ErrorCode code) {
   callback_->onAbort(stream, code);
 }
 
-void HTTPCodecPrinter::onGoaway(uint64_t lastGoodStream, ErrorCode code) {
+void HTTPCodecPrinter::onGoaway(uint64_t lastGoodStream, ErrorCode code,
+                                std::unique_ptr<folly::IOBuf> debugData) {
+  std::string debugInfo = (debugData) ? ", debug info=" +
+    std::string((char*)debugData->data(), debugData->length()) : "";
   std::cout << "GOAWAY: lastGoodStream=" << lastGoodStream
-            << ", error=" << getErrorCodeString(code) << std::endl;
-  callback_->onGoaway(lastGoodStream, code);
+            << ", error=" << getErrorCodeString(code) << debugInfo << std::endl;
+  callback_->onGoaway(lastGoodStream, code, std::move(debugData));
 }
 
 void HTTPCodecPrinter::onWindowUpdate(StreamID stream, uint32_t amount) {
@@ -100,7 +108,7 @@ void HTTPCodecPrinter::onWindowUpdate(StreamID stream, uint32_t amount) {
 void HTTPCodecPrinter::onSettings(const SettingsList& settings) {
   std::cout << "SETTINGS: num=" << settings.size() << std::endl;
   for (const auto& setting: settings) {
-    std::cout << "\tid=" << folly::to<uint8_t>(setting.id)
+    std::cout << "\tid=" << folly::to<uint16_t>(setting.id)
               << ", value=" << setting.value << std::endl;
   }
   callback_->onSettings(settings);

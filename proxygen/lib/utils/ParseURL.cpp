@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,7 +10,7 @@
 #include <proxygen/lib/utils/ParseURL.h>
 
 #include <algorithm>
-#include <arpa/inet.h>
+#include <folly/portability/Sockets.h>
 #include <proxygen/lib/http/codec/SPDYUtil.h>
 #include <proxygen/lib/utils/UtilInl.h>
 

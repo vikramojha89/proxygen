@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -13,6 +13,7 @@
 #include <folly/String.h>
 #include <folly/io/Cursor.h>
 #include <proxygen/lib/http/codec/compress/HPACKHeader.h>
+#include <iosfwd>
 
 using folly::IOBuf;
 using folly::io::Cursor;
@@ -24,22 +25,9 @@ using std::vector;
 
 namespace proxygen {
 
-const std::string kHpackNpn = "spdy/3.1-fb-0.5";
-
-HPACKCodec::HPACKCodec(TransportDirection direction) {
-  HPACK::MessageType encoderType;
-  HPACK::MessageType decoderType;
-  if (direction == TransportDirection::DOWNSTREAM) {
-    decoderType = HPACK::MessageType::REQ;
-    encoderType = HPACK::MessageType::RESP;
-  } else {
-    // UPSTREAM
-    decoderType = HPACK::MessageType::RESP;
-    encoderType = HPACK::MessageType::REQ;
-  }
-  encoder_ = folly::make_unique<HPACKEncoder>(encoderType, true);
-  decoder_ = folly::make_unique<HPACKDecoder>(decoderType, HPACK::kTableSize,
-                                              maxUncompressed_);
+HPACKCodec::HPACKCodec(TransportDirection direction)
+    : encoder_(true),
+      decoder_(HPACK::kTableSize, maxUncompressed_) {
 }
 
 unique_ptr<IOBuf> HPACKCodec::encode(vector<Header>& headers) noexcept {
@@ -56,7 +44,7 @@ unique_ptr<IOBuf> HPACKCodec::encode(vector<Header>& headers) noexcept {
 
     uncompressed += header.name.size() + header.value.size() + 2;
   }
-  auto buf = encoder_->encode(converted, encodeHeadroom_);
+  auto buf = encoder_.encode(converted, encodeHeadroom_);
   encodedSize_.compressed = 0;
   if (buf) {
     encodedSize_.compressed = buf->computeChainDataLength();
@@ -65,22 +53,22 @@ unique_ptr<IOBuf> HPACKCodec::encode(vector<Header>& headers) noexcept {
   if (stats_) {
     stats_->recordEncode(Type::HPACK, encodedSize_);
   }
-  return std::move(buf);
+  return buf;
 }
 
 Result<HeaderDecodeResult, HeaderDecodeError>
 HPACKCodec::decode(Cursor& cursor, uint32_t length) noexcept {
   outHeaders_.clear();
   decodedHeaders_.clear();
-  auto consumed = decoder_->decode(cursor, length, decodedHeaders_);
-  if (decoder_->hasError()) {
-    LOG(ERROR) << "decoder state: " << decoder_->getTable();
+  auto consumed = decoder_.decode(cursor, length, decodedHeaders_);
+  if (decoder_.hasError()) {
+    LOG(ERROR) << "decoder state: " << decoder_.getTable();
     LOG(ERROR) << "partial headers: ";
     for (const auto& hdr: decodedHeaders_) {
       LOG(ERROR) << "name=" << hdr.name.c_str()
                  << " value=" << hdr.value.c_str();
     }
-    auto err = decoder_->getError();
+    auto err = decoder_.getError();
     if (err == HPACK::DecodeError::HEADERS_TOO_LARGE ||
         err == HPACK::DecodeError::LITERAL_TOO_LARGE) {
       if (stats_) {
@@ -122,8 +110,8 @@ void HPACKCodec::decodeStreaming(
     HeaderCodec::StreamingCallback* streamingCb) noexcept {
   decodedSize_.uncompressed = 0;
   streamingCb_ = streamingCb;
-  auto consumed = decoder_->decodeStreaming(cursor, length, this);
-  if (decoder_->hasError()) {
+  auto consumed = decoder_.decodeStreaming(cursor, length, this);
+  if (decoder_.hasError()) {
     onDecodeError(HeaderDecodeError::NONE);
     return;
   }
@@ -150,9 +138,20 @@ void HPACKCodec::onDecodeError(HeaderDecodeError decodeError) {
   if (stats_) {
     stats_->recordDecodeError(Type::HPACK);
   }
-  if (decoder_->getError() == HPACK::DecodeError::HEADERS_TOO_LARGE) {
+  if (decoder_.getError() == HPACK::DecodeError::HEADERS_TOO_LARGE) {
     streamingCb_->onDecodeError(HeaderDecodeError::HEADERS_TOO_LARGE);
   }
   streamingCb_->onDecodeError(HeaderDecodeError::BAD_ENCODING);
 }
+
+void HPACKCodec::describe(std::ostream& stream) const {
+  stream << "DecoderTable:\n" << decoder_;
+  stream << "EncoderTable:\n" << encoder_;
+}
+
+std::ostream& operator<<(std::ostream& os, const HPACKCodec& codec) {
+  codec.describe(os);
+  return os;
+}
+
 }

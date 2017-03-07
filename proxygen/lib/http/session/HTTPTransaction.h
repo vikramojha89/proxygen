@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -15,18 +15,20 @@
 #include <folly/SocketAddress.h>
 #include <folly/io/async/DelayedDestructionBase.h>
 #include <folly/io/async/HHWheelTimer.h>
+#include <iosfwd>
 #include <wangle/acceptor/TransportInfo.h>
-#include <ostream>
 #include <proxygen/lib/http/HTTPConstants.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
 #include <proxygen/lib/http/HTTPMessage.h>
 #include <proxygen/lib/http/ProxygenErrorEnum.h>
 #include <proxygen/lib/http/Window.h>
 #include <proxygen/lib/http/codec/HTTPCodec.h>
+#include <proxygen/lib/http/session/HTTP2PriorityQueue.h>
 #include <proxygen/lib/http/session/HTTPEvent.h>
 #include <proxygen/lib/http/session/HTTPTransactionEgressSM.h>
 #include <proxygen/lib/http/session/HTTPTransactionIngressSM.h>
 #include <proxygen/lib/utils/Time.h>
+#include <proxygen/lib/utils/WheelTimerInstance.h>
 #include <set>
 
 namespace proxygen {
@@ -167,7 +169,7 @@ class HTTPTransactionHandler {
    * 'length'. You will receive onBody() after this. Also, the length will
    * be greater than zero.
    */
-  virtual void onChunkHeader(size_t length) noexcept {};
+  virtual void onChunkHeader(size_t /* length */) noexcept {};
 
   /**
    * Can be called multiple times per transaction. If you had previously
@@ -235,15 +237,16 @@ class HTTPTransactionHandler {
    * TODO: Reconsider default implementation here. If the handler
    * does not implement, better set max initiated to 0 in a settings frame?
    */
-  virtual void onPushedTransaction(HTTPTransaction* txn) noexcept {}
+  virtual void onPushedTransaction(HTTPTransaction* /* txn */) noexcept {}
 
   /**
-   * Ask the handler to summarize the Transaction information base on
-   * handler callback. By default return a non-init struct.
+   * Inform the handler that a GOAWAY has been received on the
+   * transport. This callback will only be invoked if the transport is
+   * SPDY or HTTP/2. It may be invoked multiple times, as HTTP/2 allows this.
+   *
+   * @param code The error code received in the GOAWAY frame
    */
-  virtual TransactionInfo getTransactionInfo() const noexcept {
-    return TransactionInfo();
-  }
+  virtual void onGoaway(ErrorCode /* code */) noexcept {}
 
   virtual ~HTTPTransactionHandler() {}
 };
@@ -252,15 +255,15 @@ class HTTPPushTransactionHandler : public HTTPTransactionHandler {
  public:
   ~HTTPPushTransactionHandler() override {}
 
-  void onHeadersComplete(std::unique_ptr<HTTPMessage> msg) noexcept final {
+  void onHeadersComplete(std::unique_ptr<HTTPMessage>) noexcept final {
     LOG(FATAL) << "push txn received headers";
   }
 
-  void onBody(std::unique_ptr<folly::IOBuf> chain) noexcept final {
+  void onBody(std::unique_ptr<folly::IOBuf>) noexcept final {
     LOG(FATAL) << "push txn received body";
   }
 
-  void onChunkHeader(size_t length) noexcept final {
+  void onChunkHeader(size_t /* length */) noexcept final {
     LOG(FATAL) << "push txn received chunk header";
   }
 
@@ -268,8 +271,7 @@ class HTTPPushTransactionHandler : public HTTPTransactionHandler {
     LOG(FATAL) << "push txn received chunk complete";
   }
 
-  void onTrailers(std::unique_ptr<HTTPHeaders> trailers)
-    noexcept final {
+  void onTrailers(std::unique_ptr<HTTPHeaders>) noexcept final {
     LOG(FATAL) << "push txn received trailers";
   }
 
@@ -277,13 +279,37 @@ class HTTPPushTransactionHandler : public HTTPTransactionHandler {
     LOG(FATAL) << "push txn received EOM";
   }
 
-  void onUpgrade(UpgradeProtocol protocol) noexcept final {
+  void onUpgrade(UpgradeProtocol) noexcept final {
     LOG(FATAL) << "push txn received upgrade";
   }
 
-  void onPushedTransaction(HTTPTransaction* txn) noexcept final {
+  void onPushedTransaction(HTTPTransaction*) noexcept final {
     LOG(FATAL) << "push txn received push txn";
   }
+};
+
+/**
+ * Callback interface to be notified of events on the byte stream.
+ */
+class HTTPTransactionTransportCallback {
+ public:
+  virtual void firstHeaderByteFlushed() noexcept = 0;
+
+  virtual void firstByteFlushed() noexcept = 0;
+
+  virtual void lastByteFlushed() noexcept = 0;
+
+  virtual void lastByteAcked(std::chrono::milliseconds latency) noexcept = 0;
+
+  virtual void headerBytesGenerated(HTTPHeaderSize& size) noexcept = 0;
+
+  virtual void headerBytesReceived(const HTTPHeaderSize& size) noexcept = 0;
+
+  virtual void bodyBytesGenerated(size_t nbytes) noexcept = 0;
+
+  virtual void bodyBytesReceived(size_t size) noexcept = 0;
+
+  virtual ~HTTPTransactionTransportCallback() {};
 };
 
 class HTTPTransaction :
@@ -305,7 +331,8 @@ class HTTPTransaction :
 
     virtual void sendHeaders(HTTPTransaction* txn,
                              const HTTPMessage& headers,
-                             HTTPHeaderSize* size) noexcept = 0;
+                             HTTPHeaderSize* size,
+                             bool eom) noexcept = 0;
 
     virtual size_t sendBody(HTTPTransaction* txn,
                             std::unique_ptr<folly::IOBuf>,
@@ -323,6 +350,9 @@ class HTTPTransaction :
 
     virtual size_t sendAbort(HTTPTransaction* txn,
                              ErrorCode statusCode) noexcept = 0;
+
+    virtual size_t sendPriority(HTTPTransaction* txn,
+                                const http2::PriorityUpdate& pri) noexcept = 0;
 
     virtual size_t sendWindowUpdate(HTTPTransaction* txn,
                                     uint32_t bytes) noexcept = 0;
@@ -353,49 +383,23 @@ class HTTPTransaction :
 
     virtual HTTPTransaction* newPushedTransaction(
       HTTPCodec::StreamID assocStreamId,
-      HTTPTransaction::PushHandler* handler,
-      int8_t priority) noexcept = 0;
+      HTTPTransaction::PushHandler* handler) noexcept = 0;
+
+    virtual std::string getSecurityProtocol() const = 0;
+
+    virtual void addWaitingForReplaySafety(
+        folly::AsyncTransport::ReplaySafetyCallback* callback) noexcept = 0;
+
+    virtual void removeWaitingForReplaySafety(
+        folly::AsyncTransport::ReplaySafetyCallback* callback) noexcept = 0;
+
+    virtual size_t getNumWaitingForReplaySafety() const = 0;
+
+    virtual const folly::AsyncTransportWrapper* getUnderlyingTransport()
+      const noexcept = 0;
   };
 
-  /**
-   * Callback interface to be notified of events on the byte stream.
-   */
-  class TransportCallback {
-   public:
-    virtual void firstHeaderByteFlushed() noexcept = 0;
-
-    virtual void firstByteFlushed() noexcept = 0;
-
-    virtual void lastByteFlushed() noexcept = 0;
-
-    virtual void lastByteAcked(std::chrono::milliseconds latency) noexcept = 0;
-
-    virtual void headerBytesGenerated(HTTPHeaderSize& size) noexcept = 0;
-
-    virtual void headerBytesReceived(const HTTPHeaderSize& size) noexcept = 0;
-
-    virtual void bodyBytesGenerated(size_t nbytes) noexcept = 0;
-
-    virtual void bodyBytesReceived(size_t size) noexcept = 0;
-
-    virtual ~TransportCallback() {};
-  };
-
-  struct LessP {
-    bool operator()(const HTTPTransaction* left,
-                    const HTTPTransaction* right) const {
-      // larger values are logically smaller
-      return left->priority_ > right->priority_;
-    }
-  };
-
-  typedef boost::heap::d_ary_heap<HTTPTransaction*,
-                                  boost::heap::arity<2>,
-                                  boost::heap::stable<false>,
-                                  boost::heap::compare<LessP>,
-                                  boost::heap::mutable_<true>,
-                                  boost::heap::constant_time_size<true>
-                                  > PriorityQueue;
+  typedef HTTPTransactionTransportCallback TransportCallback;
 
   /**
    * readBufLimit and sendWindow are only used if useFlowControl is
@@ -410,16 +414,21 @@ class HTTPTransaction :
                   HTTPCodec::StreamID id,
                   uint32_t seqNo,
                   Transport& transport,
-                  PriorityQueue& egressQueue,
-                  folly::HHWheelTimer* transactionIdleTimeouts,
+                  HTTP2PriorityQueue& egressQueue,
+                  const WheelTimerInstance& timeout,
                   HTTPSessionStats* stats = nullptr,
                   bool useFlowControl = false,
                   uint32_t receiveInitialWindowSize = 0,
                   uint32_t sendInitialWindowSize = 0,
-                  int8_t priority = -1,
+                  http2::PriorityUpdate = http2::DefaultPriority,
                   HTTPCodec::StreamID assocStreamId = 0);
 
   ~HTTPTransaction() override;
+
+  void reset(bool useFlowControl,
+             uint32_t receiveInitialWindowSize,
+             uint32_t receiveStreamWindowSize,
+             uint32_t sendInitialWindowSize);
 
   HTTPCodec::StreamID getID() const { return id_; }
 
@@ -429,7 +438,7 @@ class HTTPTransaction :
 
   Transport& getTransport() { return transport_; }
 
-  void setHandler(Handler* handler) {
+  virtual void setHandler(Handler* handler) {
     handler_ = handler;
     if (handler_) {
       handler_->setTransaction(this);
@@ -440,12 +449,19 @@ class HTTPTransaction :
     return handler_;
   }
 
-  uint32_t getPriority() const {
+  http2::PriorityUpdate getPriority() const {
     return priority_;
   }
 
-  TransactionInfo getTransactionInfo() const {
-    return txnInfo_;
+  std::tuple<uint64_t, uint64_t, double> getPrioritySummary() const {
+    return std::make_tuple(
+        insertDepth_,
+        currentDepth_,
+        egressCalls_ > 0 ? cumulativeRatio_ / egressCalls_ : 0);
+  }
+
+  bool getPriorityFallback() const {
+    return priorityFallback_;
   }
 
   HTTPTransactionEgressSM::State getEgressState() const {
@@ -575,6 +591,15 @@ class HTTPTransaction :
   void onError(const HTTPException& error);
 
   /**
+   * Invoked by the session when a GOAWAY frame is received.
+   * TODO: we may consider exposing the additional debug data here in the
+   * future.
+   *
+   * @param code The error code received in the GOAWAY frame
+   */
+  void onGoaway(ErrorCode code);
+
+  /**
    * Invoked by the session when there is a timeout on the ingress stream.
    * Note that each transaction has its own timer but the session
    * is the effective target of the timer.
@@ -599,7 +624,7 @@ class HTTPTransaction :
    * Notify this transaction that it is ok to egress.  Returns true if there
    * is additional pending egress
    */
-  bool onWriteReady(uint32_t maxEgress);
+  bool onWriteReady(uint32_t maxEgress, double ratio);
 
   /**
    * Invoked by the session when there is a timeout on the egress stream.
@@ -698,7 +723,7 @@ class HTTPTransaction :
   /**
    * @return true if we can send headers on this transaction
    */
-  bool canSendHeaders() const {
+  virtual bool canSendHeaders() const {
     return HTTPTransactionEgressSM::canTransit(
         egressState_,
         HTTPTransactionEgressSM::Event::sendHeaders)
@@ -712,9 +737,14 @@ class HTTPTransaction :
    * Note: This method should be called once per message unless the first
    * headers sent indicate a 1xx status.
    *
+   * sendHeaders will not set EOM flag in header frame, whereas
+   * sendHeadersWithEOM will. sendHeadersWithOptionalEOM backs both of them.
+   *
    * @param headers  Message headers
    */
   virtual void sendHeaders(const HTTPMessage& headers);
+  virtual void sendHeadersWithEOM(const HTTPMessage& headers);
+  virtual void sendHeadersWithOptionalEOM(const HTTPMessage& headers, bool eom);
 
   /**
    * Send part or all of the egress message body to the Transport. If flow
@@ -867,6 +897,12 @@ class HTTPTransaction :
   bool isEgressPaused() const { return handlerEgressPaused_; }
 
   /**
+   * @return true iff egress processing is paused due to flow control
+   * to the handler
+   */
+  bool isFlowControlPaused() const { return flowControlPaused_; }
+
+  /**
    * @return true iff this transaction can be used to push resources to
    * the remote side.
    */
@@ -883,11 +919,11 @@ class HTTPTransaction :
    * transaction is impossible right now.
    */
   virtual HTTPTransaction* newPushedTransaction(
-    HTTPPushTransactionHandler* handler, uint8_t priority) {
+    HTTPPushTransactionHandler* handler) {
     if (isEgressEOMSeen()) {
       return nullptr;
     }
-    auto txn = transport_.newPushedTransaction(id_, handler, priority);
+    auto txn = transport_.newPushedTransaction(id_, handler);
     if (txn) {
       pushedTransactions_.insert(txn->getID());
     }
@@ -957,12 +993,10 @@ class HTTPTransaction :
    * Schedule or refresh the timeout for this transaction
    */
   void refreshTimeout() {
-    if (transactionIdleTimeouts_) {
-      if (hasIdleTimeout()) {
-        transactionIdleTimeouts_->scheduleTimeout(this, getIdleTimeout());
-      } else {
-        transactionIdleTimeouts_->scheduleTimeout(this);
-      }
+    if (hasIdleTimeout()) {
+      timeout_.scheduleTimeout(this, getIdleTimeout());
+    } else {
+      timeout_.scheduleTimeout(this);
     }
   }
 
@@ -1005,9 +1039,45 @@ class HTTPTransaction :
    */
   void describe(std::ostream& os) const;
 
+  /**
+   * Change the priority of this transaction, may generate a PRIORITY frame
+   */
+  void updateAndSendPriority(int8_t newPriority);
+  void updateAndSendPriority(const http2::PriorityUpdate& pri);
+
+  /**
+   * Notify of priority change, will not generate a PRIORITY frame
+   */
+  void onPriorityUpdate(const http2::PriorityUpdate& priority);
+
+  /**
+   * Add a callback waiting for this transaction to have a transport with
+   * replay protection.
+   */
+  virtual void addWaitingForReplaySafety(
+      folly::AsyncTransport::ReplaySafetyCallback* callback) {
+    transport_.addWaitingForReplaySafety(callback);
+  }
+
+  /**
+   * Remove a callback waiting for replay protection (if it was canceled).
+   */
+  virtual void removeWaitingForReplaySafety(
+      folly::AsyncTransport::ReplaySafetyCallback* callback) {
+    transport_.removeWaitingForReplaySafety(callback);
+  }
+
+  virtual size_t getNumWaitingForReplaySafety() const {
+    return transport_.getNumWaitingForReplaySafety();
+  }
+
+  int32_t getRecvToAck() const;
+
  private:
   HTTPTransaction(const HTTPTransaction&) = delete;
   HTTPTransaction& operator=(const HTTPTransaction&) = delete;
+
+  void onDelayedDestroy(bool delayed) override;
 
   /**
    * Invokes the handler's onEgressPaused/Resumed if the handler's pause
@@ -1050,12 +1120,11 @@ class HTTPTransaction :
 
   bool maybeDelayForRateLimit();
 
-  bool isEnqueued() const { return enqueued_; }
+  bool isEnqueued() const { return queueHandle_->isEnqueued(); }
 
   void dequeue() {
     DCHECK(isEnqueued());
-    egressQueue_.erase(queueHandle_);
-    enqueued_ = false;
+    egressQueue_.clearPendingEgress(queueHandle_);
   }
 
   bool hasPendingEOM() const {
@@ -1064,6 +1133,8 @@ class HTTPTransaction :
   }
 
   bool isExpectingIngress() const;
+
+  bool isExpectingWindowUpdate() const;
 
   void updateReadTimeout();
 
@@ -1125,7 +1196,6 @@ class HTTPTransaction :
    */
   folly::IOBufQueue deferredEgressBody_{folly::IOBufQueue::cacheChainLength()};
 
-  TransactionInfo txnInfo_;
   const TransportDirection direction_;
   HTTPCodec::StreamID id_;
   uint32_t seqNo_;
@@ -1135,7 +1205,7 @@ class HTTPTransaction :
     HTTPTransactionEgressSM::getNewInstance()};
   HTTPTransactionIngressSM::State ingressState_{
     HTTPTransactionIngressSM::getNewInstance()};
-  folly::HHWheelTimer* transactionIdleTimeouts_{nullptr};
+  WheelTimerInstance timeout_;
   HTTPSessionStats* stats_{nullptr};
 
   /**
@@ -1167,13 +1237,12 @@ class HTTPTransaction :
   /**
    * Reference to our priority queue
    */
-  PriorityQueue& egressQueue_;
+  HTTP2PriorityQueue& egressQueue_;
 
   /**
-   * Handle to our position in the priority queue. Only valid when
-   * enqueued_ == true
+   * Handle to our position in the priority queue.
    */
-  PriorityQueue::handle_type queueHandle_;
+  HTTP2PriorityQueue::Handle queueHandle_;
 
   /**
    * bytes we need to acknowledge to the remote end using a window update
@@ -1191,9 +1260,25 @@ class HTTPTransaction :
   std::set<HTTPCodec::StreamID> pushedTransactions_;
 
   /**
-   * SPDY priority in the high bits, randomness in the low bits
+   * Priority of this transaction
    */
-  uint32_t priority_;
+  http2::PriorityUpdate priority_;
+
+  /**
+   * Information about this transaction's priority.
+   *
+   * insertDepth_ is the depth of this node in the tree when the txn was created
+   * currentDepth_ is the depth of this node in the tree after the last
+   *               onPriorityUpdate. It may not reflect its real position in
+   *               realtime, since after the last onPriorityUpdate, it may get
+   *               reparented as parent transactions complete.
+   * cumulativeRatio_ / egressCalls_ is the average relative weight of this
+   *                                 txn during egress
+   */
+  uint64_t insertDepth_{0};
+  uint64_t currentDepth_{0};
+  double cumulativeRatio_{0};
+  uint64_t egressCalls_{0};
 
   /**
    * If this transaction represents a request (ie, it is backed by an
@@ -1203,20 +1288,23 @@ class HTTPTransaction :
    * could take on multiple 1xx values, and then take on 200.
    */
   uint16_t lastResponseStatus_{0};
+  folly::Optional<uint64_t> expectedContentLengthRemaining_;
 
   bool ingressPaused_:1;
   bool egressPaused_:1;
+  bool flowControlPaused_:1;
   bool handlerEgressPaused_:1;
   bool egressRateLimited_:1;
   bool useFlowControl_:1;
   bool aborted_:1;
   bool deleting_:1;
-  bool enqueued_:1;
   bool firstByteSent_:1;
   bool firstHeaderByteSent_:1;
   bool inResume_:1;
   bool inActiveSet_:1;
   bool ingressErrorSeen_:1;
+  bool priorityFallback_:1;
+  bool headRequest_:1;
 
   static uint64_t egressBufferLimit_;
 

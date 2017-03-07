@@ -28,26 +28,14 @@ AC_LANG([C++])
 AC_PROG_CXX
 AC_PROG_CC
 AC_PROG_CPP
-AC_CXX_COMPILE_STDCXX_0X
 AC_PROG_RANLIB
+AX_CXX_COMPILE_STDCXX_14
 
-# Be sure to add any -std option to CXXFLAGS before we invoke any
-# AC_COMPILE_IFELSE() or similar macros. Any such macros that are invoked
-# before we update CXXFLAGS will not be run with the same options that we use
-# during the real build.
-STD=""
-if test "x$ac_cv_cxx_compile_cxx0x_cxx" = xyes; then
-   STD="-std=c++0x"
-fi
-if test "x$ac_cv_cxx_compile_cxx0x_gxx" = xyes; then
-   STD="-std=gnu++0x"
-fi
-
-CXXFLAGS="$STD $CXXFLAGS"
 CXXFLAGS="-fno-strict-aliasing $CXXFLAGS"
 CXXFLAGS="-O3 -g -W -Wall -Wextra -Wno-unused-parameter $CXXFLAGS"
 CXXFLAGS=" -Wno-missing-field-initializers -Wno-deprecated $CXXFLAGS"
 CXXFLAGS="-DLIBMC_FBTRACE_DISABLE $CXXFLAGS"
+CXXFLAGS="-pthread $CXXFLAGS"
 
 CFLAGS="-DLIBMC_FBTRACE_DISABLE $CFLAGS"
 
@@ -225,11 +213,11 @@ AM_CONDITIONAL([HAVE_STD_THREAD], [test "$ac_cv_header_features" = "yes"])
 AM_CONDITIONAL([HAVE_X86_64], [test "$build_cpu" = "x86_64"])
 AM_CONDITIONAL([HAVE_LINUX], [test "$build_os" == "linux-gnu"])
 AM_CONDITIONAL([HAVE_WEAK_SYMBOLS], [test "$ac_have_weak_symbols" = "yes"])
-AM_CONDITIONAL([HAVE_BITS_FUNCTEXCEPT], [test "$ac_cv_header_bits_functexcept" = "yes"])
+AM_CONDITIONAL([HAVE_BITS_FUNCTEXCEPT_H], [test "$ac_cv_header_bits_functexcept" = "yes"])
 
 # Include directory that contains "proxygen" so #include "proxygen/Foo.h" works
 # Also add includes for gmock and gtest
-AM_CPPFLAGS='-I$(top_srcdir)/.. -I$(top_srcdir)/lib/test/gmock-1.7.0/include -I$(top_srcdir)/lib/test/gmock-1.7.0/gtest/include'
+AM_CPPFLAGS='-I$(top_srcdir)/.. -I$(top_srcdir)/lib/test/googletest-release-1.8.0/googlemock/include -I$(top_srcdir)/lib/test/googletest-release-1.8.0/googletest/include'
 AM_CPPFLAGS="$AM_CPPFLAGS $CXX_FLAGS $BOOST_CPPFLAGS"
 AC_SUBST([AM_CPPFLAGS])
 
@@ -239,7 +227,6 @@ AC_CONFIG_FILES([Makefile
                  lib/test/Makefile
                  lib/utils/Makefile
                  lib/utils/test/Makefile
-                 lib/ssl/Makefile
                  lib/services/Makefile
                  lib/http/Makefile
                  lib/http/codec/Makefile
@@ -250,6 +237,10 @@ AC_CONFIG_FILES([Makefile
                  httpserver/Makefile
                  httpserver/samples/Makefile
                  httpserver/samples/echo/Makefile
-                 httpserver/tests/Makefile])
+                 httpserver/samples/proxy/Makefile
+                 httpserver/tests/Makefile
+                 httpclient/Makefile
+                 httpclient/samples/curl/Makefile
+                 httpclient/samples/Makefile])
 
 AC_OUTPUT

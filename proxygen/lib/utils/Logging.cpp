@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -13,8 +13,8 @@
 #include <folly/Memory.h>
 #include <folly/String.h>
 #include <fstream>
-#include <iostream>
 #include <memory>
+#include <ostream>
 #include <sstream>
 #include <vector>
 #include <sys/stat.h>

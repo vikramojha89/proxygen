@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -14,7 +14,7 @@
 #include <folly/json.h>
 #include <fstream>
 #include <glog/logging.h>
-#include <iostream>
+#include <ios>
 #include <string>
 
 using folly::IOBuf;
@@ -73,7 +73,7 @@ unique_ptr<HTTPArchive> HTTPArchive::fromFile(const string& filename) {
     }
   }
 
-  return std::move(har);
+  return har;
 }
 
 void HTTPArchive::extractHeaders(folly::dynamic& obj,
@@ -81,12 +81,12 @@ void HTTPArchive::extractHeaders(folly::dynamic& obj,
   msg.clear();
   auto& headersObj = obj["headers"];
   for (size_t i = 0; i < headersObj.size(); i++) {
-    string name = headersObj[i]["name"].asString().toStdString();
+    string name = headersObj[i]["name"].asString();
     std::transform(name.begin(), name.end(), name.begin(), ::tolower);
     msg.push_back(
       HPACKHeader(
         name,
-        headersObj[i]["value"].asString().toStdString())
+        headersObj[i]["value"].asString())
     );
   }
 }
@@ -98,8 +98,8 @@ void HTTPArchive::extractHeadersFromPublic(folly::dynamic& obj,
   for (size_t i = 0; i < headersObj.size(); i++) {
     auto& headerObj = headersObj[i];
     for (auto& k: headerObj.keys()) {
-      string name = k.asString().toStdString();
-      string value = headerObj[name].asString().toStdString();
+      string name = k.asString();
+      string value = headerObj[name].asString();
       std::transform(name.begin(), name.end(), name.begin(), ::tolower);
       msg.push_back(HPACKHeader(name, value));
     }
@@ -132,7 +132,7 @@ unique_ptr<HTTPArchive> HTTPArchive::fromPublicFile(const string& filename) {
     }
   }
 
-  return std::move(har);
+  return har;
 }
 
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,8 @@
  */
 #include <proxygen/lib/http/session/HTTPSessionAcceptor.h>
 #include <proxygen/lib/http/codec/HTTP1xCodec.h>
-#include <proxygen/lib/http/codec/experimental/HTTP2Codec.h>
+#include <proxygen/lib/http/codec/HTTP2Codec.h>
+#include <proxygen/lib/http/session/HTTPDefaultSessionCodecFactory.h>
 #include <proxygen/lib/http/session/HTTPDirectResponseHandler.h>
 
 using folly::AsyncSocket;
@@ -22,17 +23,17 @@ namespace proxygen {
 
 const SocketAddress HTTPSessionAcceptor::unknownSocketAddress_("0.0.0.0", 0);
 
+HTTPSessionAcceptor::HTTPSessionAcceptor(const AcceptorConfiguration& accConfig)
+    : HTTPSessionAcceptor(accConfig, nullptr) {}
+
 HTTPSessionAcceptor::HTTPSessionAcceptor(
-  const AcceptorConfiguration& accConfig):
+  const AcceptorConfiguration& accConfig,
+  std::shared_ptr<HTTPCodecFactory> codecFactory):
     HTTPAcceptor(accConfig),
+    codecFactory_(codecFactory),
     simpleController_(this) {
-  if (!isSSL()) {
-    auto version = SPDYCodec::getVersion(accConfig.plaintextProtocol);
-    if (version) {
-      alwaysUseSPDYVersion_ = *version;
-    } else if (accConfig.plaintextProtocol == http2::kProtocolCleartextString) {
-      alwaysUseHTTP2_ = true;
-    }
+  if (!codecFactory_) {
+    codecFactory_ = std::make_shared<HTTPDefaultSessionCodecFactory>(accConfig);
   }
 }
 
@@ -54,40 +55,20 @@ const HTTPErrorPage* HTTPSessionAcceptor::getErrorPage(
 }
 
 void HTTPSessionAcceptor::onNewConnection(
-  folly::AsyncSocket::UniquePtr ssock,
+  folly::AsyncTransportWrapper::UniquePtr sock,
   const SocketAddress* peerAddress,
   const string& nextProtocol,
-  SecureTransportType secureTransportType,
+  wangle::SecureTransportType secureTransportType,
   const wangle::TransportInfo& tinfo) {
-  unique_ptr<HTTPCodec> codec;
 
-  AsyncSocket::UniquePtr sock(dynamic_cast<AsyncSocket*>(ssock.release()));
+  unique_ptr<HTTPCodec> codec
+      = codecFactory_->getCodec(nextProtocol, TransportDirection::DOWNSTREAM);
 
-  if (!isSSL() && alwaysUseSPDYVersion_) {
-    codec = folly::make_unique<SPDYCodec>(
-      TransportDirection::DOWNSTREAM,
-      alwaysUseSPDYVersion_.value(),
-      accConfig_.spdyCompressionLevel);
-  } else if (!isSSL() && alwaysUseHTTP2_) {
-    codec = folly::make_unique<HTTP2Codec>(TransportDirection::DOWNSTREAM);
-  } else if (nextProtocol.empty() ||
-             HTTP1xCodec::supportsNextProtocol(nextProtocol)) {
-    codec = folly::make_unique<HTTP1xCodec>(TransportDirection::DOWNSTREAM);
-  } else if (auto version = SPDYCodec::getVersion(nextProtocol)) {
-    codec = folly::make_unique<SPDYCodec>(
-      TransportDirection::DOWNSTREAM,
-      *version,
-      accConfig_.spdyCompressionLevel);
-  } else if (nextProtocol == http2::kProtocolString || nextProtocol == "h2") {
-    codec = folly::make_unique<HTTP2Codec>(TransportDirection::DOWNSTREAM);
-  } else {
-    // Either we advertised a protocol we don't support or the
-    // client requested a protocol we didn't advertise.
-    VLOG(2) << "Client requested unrecognized next protocol " << nextProtocol;
+  if (!codec) {
+    VLOG(2) << "codecFactory_ failed to provide codec";
+    onSessionCreationError(ProxygenError::kErrorUnsupportedScheme);
     return;
   }
-
-  CHECK(codec);
 
   auto controller = getController();
   SocketAddress localAddress;
@@ -97,19 +78,28 @@ void HTTPSessionAcceptor::onNewConnection(
     VLOG(3) << "couldn't get local address for socket";
     localAddress = unknownSocketAddress_;
   }
+  auto sessionInfoCb = sessionInfoCb_ ? sessionInfoCb_ : this;
   VLOG(4) << "Created new session for peer " << *peerAddress;
   HTTPDownstreamSession* session =
     new HTTPDownstreamSession(getTransactionTimeoutSet(), std::move(sock),
                               localAddress, *peerAddress,
-                              controller, std::move(codec), tinfo, this);
+                              controller, std::move(codec), tinfo,
+                              sessionInfoCb);
   if (accConfig_.maxConcurrentIncomingStreams) {
     session->setMaxConcurrentIncomingStreams(
         accConfig_.maxConcurrentIncomingStreams);
   }
+
+  // set HTTP2 priorities flag on session object
+  session->setHTTP2PrioritiesEnabled(accConfig_.HTTP2PrioritiesEnabled);
+
   // set flow control parameters
   session->setFlowControl(accConfig_.initialReceiveWindow,
                           accConfig_.receiveStreamWindowSize,
                           accConfig_.receiveSessionWindowSize);
+  if (accConfig_.writeBufferLimit > 0) {
+    session->setWriteBufferLimit(accConfig_.writeBufferLimit);
+  }
   session->setSessionStats(downstreamSessionStats_);
   Acceptor::addConnection(session);
   session->startNow();

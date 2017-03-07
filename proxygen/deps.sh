@@ -4,9 +4,6 @@
 ## install proxygen to use in another C++ project on this machine, run
 ## the sibling file `reinstall.sh`.
 
-FOLLY_VERSION='50b33d29c25c9cb33ff61988a6fc16ec1a25e6d0'
-WANGLE_VERSION='e15b84fd02ba8135927d54e8e586e6d8cc275f96'
-
 # Parse args
 JOBS=8
 USAGE="./deps.sh [-j num_jobs]"
@@ -47,27 +44,28 @@ sudo apt-get install -yq \
     libboost-all-dev \
     libjemalloc-dev \
     libsnappy-dev \
-    wget
+    wget \
+    unzip
 
 # Adding support for Ubuntu 12.04.x
 # Needs libdouble-conversion-dev, google-gflags and double-conversion
 # deps.sh in folly builds anyways (no trap there)
 if ! sudo apt-get install -y libgoogle-glog-dev;
 then
-	if [ ! -e google-glog ]; then
+  if [ ! -e google-glog ]; then
     echo "fetching glog from svn (apt-get failed)"
-		svn checkout https://google-glog.googlecode.com/svn/trunk/ google-glog
-		cd google-glog
-		./configure
-		make
-		sudo make install
-		cd ..
-	fi
+    svn checkout https://google-glog.googlecode.com/svn/trunk/ google-glog
+    cd google-glog
+    ./configure
+    make
+    sudo make install
+    cd ..
+  fi
 fi
 
 if ! sudo apt-get install -y libgflags-dev;
 then
-	if [ ! -e google-gflags ]; then
+  if [ ! -e google-gflags ]; then
     echo "Fetching gflags from svn (apt-get failed)"
     svn checkout https://google-gflags.googlecode.com/svn/trunk/ google-gflags
     cd google-gflags
@@ -75,19 +73,19 @@ then
     make
     sudo make install
     cd ..
-	fi
+  fi
 fi
 
 if  ! sudo apt-get install -y libdouble-conversion-dev;
 then
-	if [ ! -e double-conversion ]; then
+  if [ ! -e double-conversion ]; then
     echo "Fetching double-conversion from git (apt-get failed)"
-		git clone https://github.com/floitsch/double-conversion.git double-conversion
-		cd double-conversion
-		cmake . -DBUILD_SHARED_LIBS=ON
-		sudo make install
-		cd ..
-	fi
+    git clone https://github.com/floitsch/double-conversion.git double-conversion
+    cd double-conversion
+    cmake . -DBUILD_SHARED_LIBS=ON
+    sudo make install
+    cd ..
+  fi
 fi
 
 
@@ -98,7 +96,7 @@ if [ ! -e folly/folly ]; then
 fi
 cd folly/folly
 git fetch
-git checkout $FOLLY_VERSION
+git checkout master
 
 # Build folly
 autoreconf --install
@@ -107,8 +105,8 @@ make -j$JOBS
 sudo make install
 
 if test $? -ne 0; then
-	echo "fatal: folly build failed"
-	exit -1
+  echo "fatal: folly build failed"
+  exit -1
 fi
 cd ../..
 
@@ -119,7 +117,7 @@ if [ ! -e wangle/wangle ]; then
 fi
 cd wangle/wangle
 git fetch
-git checkout $WANGLE_VERSION
+git checkout master
 
 # Build wangle
 cmake .
@@ -127,8 +125,8 @@ make -j$JOBS
 sudo make install
 
 if test $? -ne 0; then
-	echo "fatal: wangle build failed"
-	exit -1
+  echo "fatal: wangle build failed"
+  exit -1
 fi
 cd ../..
 

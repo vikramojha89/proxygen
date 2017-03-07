@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2015, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,8 +9,8 @@
  */
 #include <deque>
 #include <folly/Memory.h>
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 #include <map>
 #include <proxygen/lib/utils/FilterChain.h>
 #include <stdlib.h>
@@ -530,4 +530,18 @@ TEST_F(OwnedGenericFilterTest, set_destination) {
   auto oldTester = chain().setDestination(std::move(tester2));
   EXPECT_CALL(*actor_, doA());
   chain()->doA();
+}
+
+TEST_F(OwnedGenericFilterTest, foreach) {
+  auto filters = getRandomFilters(20);
+  size_t count = 0;
+  chain().foreach([&count] (GenericFilter<TesterInterface,
+                            TesterInterface::Callback,
+                            &TesterInterface::setCallback, true,
+                            std::default_delete<TesterInterface> >* filter) {
+                    if (dynamic_cast<TestFilter<true>*>(filter)) {
+                      count++;
+                    }
+                  });
+  EXPECT_EQ(count, 20);
 }
